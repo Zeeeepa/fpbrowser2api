@@ -220,6 +220,12 @@ REMOTE_PROXY_NOT_FOUND_HINTS: tuple[str, ...] = (
     "id not found",
     "not found",
 )
+REMOTE_PROXY_MISSING_OR_NO_PERMISSION_HINTS: tuple[str, ...] = (
+    # RoxyBrowser 删除代理时，如果 proxy id 不属于传入的 workspaceId（或远端已不存在），
+    # 也可能返回这句通用文案。不能直接当作权限错误；需用 proxy/list 二次确认。
+    "当前账号无该空间操作权限",
+    "数据不存在",
+)
 
 
 def _build_delete_account_remark(old_remark: str, reason: str, *, window_name: str, window_key: str, window_sort_num: Any) -> str:
@@ -503,6 +509,9 @@ class UpdateTaskTypeWindowRequest(BaseModel):
 class UpsertSoraAccessTokenRequest(BaseModel):
     access_token: Optional[str] = None
     expires: Optional[str] = None
+    google_account: Optional[str] = None
+    google_password: Optional[str] = None
+    google_efa: Optional[str] = None
 
 
 class NetworkCaptureStartRequest(BaseModel):
@@ -1591,7 +1600,13 @@ async def delete_local_proxy(
     if not remote_err:
         code = _remote_response_code(rsp)
         msg = _remote_response_msg(rsp)
-        remote_already_missing = code != 0 and _remote_msg_matches(msg, REMOTE_PROXY_NOT_FOUND_HINTS)
+        remote_already_missing = code != 0 and await _is_remote_proxy_already_missing(
+            client,
+            browser=browser,
+            space=space,
+            proxy_id=int(proxy_id),
+            msg=msg,
+        )
         if code != 0 and not remote_already_missing:
             remote_err = msg or "删除代理失败"
 
@@ -2547,6 +2562,69 @@ async def _is_remote_account_already_missing(
     if not _remote_msg_matches(msg, REMOTE_ACCOUNT_MISSING_OR_NO_PERMISSION_HINTS):
         return False
     exists = await _remote_account_exists(client, browser=browser, space=space, account_id=account_id)
+    return exists is False
+
+
+def _remote_proxy_row_id(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("id") if row.get("id") is not None else row.get("proxy_id") or 0)
+    except Exception:
+        return 0
+
+
+async def _remote_proxy_exists(
+    client: FPBrowserClient,
+    *,
+    browser: Any,
+    space: Any,
+    proxy_id: int,
+) -> Optional[bool]:
+    """查询远端代理列表确认 proxy_id 是否存在。
+
+    返回：
+    - True：当前 workspace 远端列表中存在；
+    - False：列表可正常读取，但该 id 不存在；
+    - None：列表读取失败，无法判断。
+    """
+    pid = int(proxy_id or 0)
+    if pid <= 0:
+        return False
+    try:
+        rows = await client.list_proxies(
+            vendor=browser.vendor,
+            base_url=browser.lan_addr,
+            access_key=browser.access_key,
+            space_id=space.space_id,
+        )
+    except Exception as e:
+        logger.warning("verify remote proxy existence failed: proxy_id=%s err=%s", pid, e)
+        return None
+    for row in rows or []:
+        if isinstance(row, dict) and _remote_proxy_row_id(row) == pid:
+            return True
+    return False
+
+
+async def _is_remote_proxy_already_missing(
+    client: FPBrowserClient,
+    *,
+    browser: Any,
+    space: Any,
+    proxy_id: int,
+    msg: str,
+) -> bool:
+    """判断 proxy/delete 的失败是否可视为“远端已不存在/不在该空间”。
+
+    RoxyBrowser 在删除不属于当前 workspaceId 的代理，或代理已在远端消失时，
+    可能返回“当前账号无该空间操作权限或者数据不存在”。此时二次读取当前
+    workspace 的 proxy/list：如果列表可读且没有该 proxy_id，就允许继续清理
+    本地全局代理库，避免本地脏数据永远删不掉。
+    """
+    if _remote_msg_matches(msg, REMOTE_PROXY_NOT_FOUND_HINTS):
+        return True
+    if not _remote_msg_matches(msg, REMOTE_PROXY_MISSING_OR_NO_PERMISSION_HINTS):
+        return False
+    exists = await _remote_proxy_exists(client, browser=browser, space=space, proxy_id=proxy_id)
     return exists is False
 
 
@@ -4273,13 +4351,14 @@ async def refresh_mapping_subscription_info(mapping_id: int, headless: bool = Fa
 
         tier = str((info or {}).get("user_paygate_tier") or "").strip() or None
         plan_title = veo_format_paygate_tier_label(tier)
+        print(f"plan_title:{plan_title}");
         credits = int((info or {}).get("credits") or 0)
         return {
             "success": True,
             "mapping_id": mapping_id,
-            "plan_title": tier,
+            "plan_title": plan_title,
             "subscription_end": None,
-            "user_paygate_tier": tier,
+            "user_paygate_tier": plan_title,
             "credits": credits,
             "remaining_quota": credits,
             "cooldown_until": (info or {}).get("cooldown_until"),
@@ -4450,7 +4529,7 @@ async def convert_sora_session_token_to_access_token(
     ctx_row = await db.get_task_type_window_context(mapping_id)
     if not ctx_row:
         raise HTTPException(status_code=404, detail="mapping not found")
-
+    
     handler = str(ctx_row.get("create_task_handler") or "").strip().lower()
 
     vendor = str(ctx_row.get("vendor") or "roxy")
@@ -4461,28 +4540,40 @@ async def convert_sora_session_token_to_access_token(
     if not base_url or not space_id or not window_key:
         raise HTTPException(status_code=400, detail="mapping missing vendor/lan_addr/space_id/window_key")
 
-    print(f"handler: {handler}")
     if handler == "grok_workflow":
         raise HTTPException(
             status_code=400,
             detail="grok_workflow 不支持从此接口自动获取令牌：请在上方「保存」中手工粘贴 Grok SSO（与 grok2api 池化 token 同源，可选），或依赖指纹窗口内已登录的 Cookie。",
         )
 
+    google_account = str(req.google_account or ctx_row.get("platform_username") or ctx_row.get("platform_account") or "").strip()
+    google_password = str(req.google_password or ctx_row.get("platform_password") or "")
+    google_efa = str(req.google_efa or ctx_row.get("platform_efa") or "").strip()
+    
     if handler == "gpt_workflow":
         target_url = _admin_manual_open_target_url(ctx_row)
         try:
             from ..services.gpt_task_executor import gpt_fetch_access_token_in_window  # type: ignore
             from ..services.browser_extension_bridge import annotate_url_with_extension_config  # type: ignore
-
             info = await gpt_fetch_access_token_in_window(
                 browser_vendor=vendor,
                 browser_base_url=base_url,
                 browser_access_key=access_key,
                 space_id=space_id,
                 window_key=window_key,
-                target_url=annotate_url_with_extension_config(target_url, space_id=space_id, window_key=window_key),
+                target_url=annotate_url_with_extension_config(
+                    target_url,
+                    space_id=space_id,
+                    window_key=window_key,
+                    google_account=google_account,
+                    google_password=google_password,
+                    google_efa=google_efa,
+                ),
                 headless=headless,
                 pure_mode=bool(ctx_row.get("pure_mode")) if ctx_row.get("pure_mode") is not None else True,
+                google_account=google_account,
+                google_password=google_password,
+                google_efa=google_efa,
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"自动获取 GPT access_token 失败：{e}")
@@ -4566,6 +4657,9 @@ async def convert_sora_session_token_to_access_token(
             access_info = await force_fetch_access_token_in_window(
                 sess=veo_ctx,
                 target_url=target_url,
+                google_account=google_account,
+                google_password=google_password,
+                google_efa=google_efa,
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"自动获取失败：{e}")
@@ -4656,15 +4750,25 @@ async def manual_open_mapping_window(
         veo_ctx.browser_pure_mode = effective_pure
         veo_ctx.idle_close_disabled = True
         
+        #TODO clear buffer laky
         veo_ctx.idle_close_disabled = True
         try:
             veo_ctx._cancel_idle_close()
         except Exception:
             pass
+
         try:
-            await veo_ctx.close_and_drop()
-        except Exception:
-            pass
+            client = FPBrowserClient()
+            keys = [window_key]
+            local_rsp = await client.browser_clear_local_cache(
+                vendor=vendor,
+                base_url=base_url,
+                access_key=access_key,
+                window_keys=keys,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=f"清空本地缓存失败：{e}")
+
         try:
             await veo_ctx.pw_ctx.open_fingerprint_window_only(
                 args=[] if browser_only else veo_ctx.browser_open_args,
@@ -5083,8 +5187,14 @@ async def open_account_mapping_window(
         elif handler == "gpt_workflow":
             from ..services.gpt_task_executor import DEFAULT_GPT_TARGET  # type: ignore
             from ..services.veo_workflow_executor import get_or_create_veo_session  # type: ignore
+            from ..services.browser_extension_interaction import ensure_extension_connected_via_window, submit_extension_task  # type: ignore
 
             target_url = str(ctx_row.get("default_target_url") or "").strip() or DEFAULT_GPT_TARGET
+            google_account = str(ctx_row.get("platform_username") or ctx_row.get("platform_account") or "").strip()
+            google_password = str(ctx_row.get("platform_password") or "")
+            google_efa = str(ctx_row.get("platform_efa") or "").strip()
+            if not google_account or not google_password:
+                raise HTTPException(status_code=400, detail="未找到google账号")
             gpt_ctx = get_or_create_veo_session(vendor=vendor, base_url=base_url, access_key=access_key, space_id=space_id, window_key=window_key)
             gpt_ctx.browser_headless = headless
             gpt_ctx.browser_pure_mode = effective_pure
@@ -5093,12 +5203,38 @@ async def open_account_mapping_window(
                 gpt_ctx._cancel_idle_close()
             except Exception:
                 pass
-            await gpt_ctx.pw_ctx.open_fingerprint_window_only(args=[target_url], force_open=False, headless=headless, pure_mode=effective_pure)
-            try:
-                await gpt_ctx.disconnect_playwright_under_bring_lock()
-            except Exception:
-                pass
-            result = {"message": "已打开 ChatGPT 页面，已断开自动化连接（请在本窗口完成登录）", "target_url": target_url}
+            client = await ensure_extension_connected_via_window(
+                sess=gpt_ctx,
+                target_url="https://accounts.google.com/",
+                space_id=space_id,
+                window_key=window_key,
+                wait_seconds=10.0,
+                log_file=getattr(gpt_ctx, "_log_file", None),
+                force_open=False,
+                headless=headless,
+                pure_mode=effective_pure,
+                auto_triger_connection=True,
+                google_account=google_account,
+                google_password=google_password,
+                google_efa=google_efa,
+            )
+            if client is None:
+                raise RuntimeError(f"?????????window_key={window_key!r}")
+            result = await submit_extension_task(
+                space_id=space_id,
+                window_key=window_key,
+                provider="gpt",
+                payload={
+                    "action": "google_auto_login",
+                    "workflow_kind": "google_auto_login",
+                    "target_url": target_url,
+                    "google_account": google_account,
+                    "google_password": google_password,
+                    "google_efa": google_efa,
+                },
+                progress_cb=_progress_cb,
+                timeout_seconds=timeout_seconds,
+            )
         else:
             raise HTTPException(
                 status_code=400,

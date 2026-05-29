@@ -95,11 +95,19 @@ OPENAI_COMPAT_VIDEO_MODELS = (
     "nana-banana-pro-4k",
     "veo-3-1",
     "veo-omni-flash",
+    "veo-omni-flash-video-edit",
     "gpt-image2-1k",
     "gpt-image2-2k",
     "gpt-image2-4k",
 )
 OPENAI_COMPAT_VIDEO_MODEL_SET = set(OPENAI_COMPAT_VIDEO_MODELS)
+OPENAI_COMPAT_NOOP_MODELS = (
+    # 专用于 NewAPI 按次扣费：不创建真实任务，只返回一个合法的
+    # OpenAI chat completion 响应，让 NewAPI 完成鉴权、日志和额度扣减。
+    "fpbrowser-use",
+)
+OPENAI_COMPAT_NOOP_MODEL_SET = set(OPENAI_COMPAT_NOOP_MODELS)
+OPENAI_COMPAT_MODEL_SET = OPENAI_COMPAT_VIDEO_MODEL_SET | OPENAI_COMPAT_NOOP_MODEL_SET
 GPT_IMAGE2_VIDEO_MODELS: Dict[str, str] = {
     "gpt-image2-1k": "1k",
     "gpt-image2-2k": "2k",
@@ -118,10 +126,26 @@ def _normalize_video_task_payload(payload: Dict[str, Any]) -> tuple[str, Dict[st
         task_type_code = "veo_workflow"
         payload["n_frames"] = 1
         payload["image_model_name"] = "NARWHAL"
+        raw_resolution = payload.get("resolution")
+        if raw_resolution is None:
+            raw_resolution = "1k"
+        else:
+            raw_resolution = raw_resolution.lower()
+            if raw_resolution == "4k":
+                raw_resolution = "1k"
+        payload["resolution"] = raw_resolution
     elif model in {"nana-banana-pro"}:
         task_type_code = "veo_workflow"
         payload["n_frames"] = 1
         payload["image_model_name"] = "GEM_PIX_2"
+        raw_resolution = payload.get("resolution")
+        if raw_resolution is None:
+            raw_resolution = "1k"
+        else:
+            raw_resolution = raw_resolution.lower()
+            if raw_resolution == "4k":
+                raw_resolution = "1k"
+        payload["resolution"] = raw_resolution
     elif model in {"nana-banana-2-4k"}:
         task_type_code = "veo_workflow"
         payload["n_frames"] = 1
@@ -138,6 +162,8 @@ def _normalize_video_task_payload(payload: Dict[str, Any]) -> tuple[str, Dict[st
         if duration != 8:
             raise HTTPException(status_code=400, detail="veo-3-1 only supports duration=8")
         payload["n_frames"] = 240
+        payload.pop("video_model", None)
+        payload.pop("video_url", None)
     elif model in {"veo-omni-flash"}:
         task_type_code = "veo_workflow"
         duration = payload.get("duration")
@@ -145,6 +171,15 @@ def _normalize_video_task_payload(payload: Dict[str, Any]) -> tuple[str, Dict[st
             raise HTTPException(status_code=400, detail="veo-omni-flash only supports duration=10")
         payload["n_frames"] = 300
         payload["video_model"] = "abra_t2v_10s"
+        payload.pop("video_url", None)
+    elif model in {"veo-omni-flash-video-edit"}:
+        task_type_code = "veo_workflow"
+        duration = payload.get("duration")
+        if duration != 8:
+            raise HTTPException(status_code=400, detail="veo-omni-flash only supports duration=8")
+        payload["n_frames"] = 300
+        payload["video_model"] = "abra_t2v_10s"
+        payload["model"] = "veo-omni-flash"
     elif model in GPT_IMAGE2_VIDEO_MODELS:
         task_type_code = "gpt_workflow"
         duration = payload.get("duration")
@@ -630,7 +665,7 @@ async def list_openai_compatible_models(api_key: str = Depends(verify_api_key_he
                 "created": now,
                 "owned_by": "fpbrowser2api",
             }
-            for model in OPENAI_COMPAT_VIDEO_MODELS
+            for model in (*OPENAI_COMPAT_VIDEO_MODELS, *OPENAI_COMPAT_NOOP_MODELS)
         ],
     }
 
@@ -640,7 +675,7 @@ async def get_openai_compatible_model(model_id: str, api_key: str = Depends(veri
     """OpenAI-compatible single model lookup."""
 
     model = (model_id or "").strip()
-    if model not in OPENAI_COMPAT_VIDEO_MODEL_SET:
+    if model not in OPENAI_COMPAT_MODEL_SET:
         raise HTTPException(status_code=404, detail="model not found")
     return {
         "id": model,
@@ -655,15 +690,22 @@ async def create_chat_completion_for_newapi_test(
     api_key: str = Depends(verify_api_key_header),
     body: Dict[str, Any] = Body(...),
 ):
-    """Minimal OpenAI chat-compatible endpoint for NewAPI channel tests.
+    """Minimal OpenAI chat-compatible endpoint for NewAPI channel tests/charging.
 
     NewAPI's OpenAI-channel "test" button probes `/v1/chat/completions`.
     The real video creation endpoint is `/v1/videos`; this endpoint only
-    returns a lightweight success response for the public video model names so
-    channel health checks do not create real video tasks.
+    returns a lightweight success response.
+
+    Special model:
+    - `fpbrowser-use`: no-op charging model for NewAPI. It does not create any
+      real task; NewAPI can configure this model as fixed-price / per-call so
+      every successful request deducts quota.
     """
 
     model = str((body or {}).get("model") or "").strip()
+    if model == "fpbrowser-use":
+        return _build_openai_chat_completion(model, "ok")
+
     if model not in OPENAI_COMPAT_VIDEO_MODEL_SET:
         raise HTTPException(
             status_code=400,

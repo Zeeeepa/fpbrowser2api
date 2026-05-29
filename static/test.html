@@ -53,26 +53,22 @@
                 <select class="form-select mono" id="cardKeySelect">
                   <option value="">不使用卡密</option>
                 </select>
-                <div class="text-muted small">选项前缀是序号，便于快速定位第几个卡密。</div>
               </div>
               <div class="mb-3">
                 <label class="form-label">执行窗口（可选）</label>
                 <select class="form-select" id="taskWindow"></select>
-                <div class="text-muted small">不选择则由后端按任务类型自动挑选可用窗口（默认机制）。</div>
               </div>
               <div class="mb-3">
-                <label class="form-label">文本内容</label>
+                <label class="form-label">提示词</label>
                 <textarea class="form-control" id="prompt" rows="5" placeholder="输入文本提示词"></textarea>
               </div>
               <div class="mb-3">
-                <label class="form-label">角色视频链接 video_url（可选，用于创建角色）</label>
+                <label class="form-label">视频链接 video_url</label>
                 <input class="form-control mono" id="videoUrl" placeholder="https://... (mp4)" />
-                <div class="text-muted small">当填写 video_url 时，后端将优先走“创建角色”流程（prompt 可留空）。限制：视频 ≤5 秒、≤10MB。</div>
               </div>
               <div class="mb-3">
-                <label class="form-label">首帧图片链接 first_image_url（可选）</label>
+                <label class="form-label">参考图链接</label>
                 <input class="form-control mono" id="firstImageUrl" placeholder="https://..." />
-                <div class="text-muted small">后端不再接收图片二进制，只接收网络链接（由 handler 自行处理）。</div>
               </div>
               <div class="mb-3 form-check">
                 <input class="form-check-input" type="checkbox" id="dreaminaImageUploadWorkflow" />
@@ -98,7 +94,7 @@
                 </select>
               </div>
               <div class="mb-3">
-                <label class="form-label">图片宽高比 aspect_ratio（可选）</label>
+                <label class="form-label">生成尺寸</label>
                 <select class="form-select" id="aspectRatio">
                   <option value="1:1">1:1（默认）</option>
                   <option value="16:9">16:9</option>
@@ -106,12 +102,6 @@
                   <option value="4:3">4:3</option>
                   <option value="3:4">3:4</option>
                 </select>
-                <div class="text-muted small">会传入 payload.aspect_ratio，并由 GPT image2 按分辨率档位选择实际 size。</div>
-              </div>
-              <div class="mb-3 form-check">
-                <input class="form-check-input" type="checkbox" id="headlessMode" />
-                <label class="form-check-label" for="headlessMode">无头模式打开窗口</label>
-                <div class="text-muted small">勾选后将以无头模式（headless）打开指纹浏览器窗口，不显示界面。</div>
               </div>
               <button class="btn btn-primary" id="btnSubmit">提交任务</button>
             </div>
@@ -368,8 +358,6 @@
             payload.image_model_name = "gpt-image-2";
             payload.gpt_image2_model = payload.model;
           }
-          const headlessChecked = document.getElementById("headlessMode")?.checked === true;
-          if (headlessChecked) payload.headless = true;
 
           let mappingId = null;
           if (mappingIdRaw) {

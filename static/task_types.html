@@ -827,6 +827,7 @@
         transferTargetTypeId: `${LS_PREFIX}task_types.transfer_target_type_id`,
         transferTargetSpacePk: `${LS_PREFIX}task_types.transfer_target_space_pk`,
         rollbackTargetTypeId: `${LS_PREFIX}task_types.rollback_target_type_id`,
+        dataTransferText: `${LS_PREFIX}task_types.data_transfer_text`,
         aiOpModel: `${LS_PREFIX}task_types.ai_op_model`,
         aiOpMaxSteps: `${LS_PREFIX}task_types.ai_op_max_steps`,
         aiOpPrompt: `${LS_PREFIX}task_types.ai_op_prompt`,
@@ -1110,6 +1111,67 @@
         return `${ip}|${country}|安全:${risk}-${asnType}|绑:${bind}|成功:${succ}`;
       }
 
+      function inferProxyIdByAddrFromItems(dsAddr, items) {
+        const addr = String(dsAddr || "").trim();
+        const list = Array.isArray(items) ? items : [];
+        if (!addr || !list.length) return 0;
+        const isIpv4 = (s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(String(s || "").trim());
+        if (addr.includes(":")) {
+          const parts = addr.split(":");
+          const h = String(parts[0] || "").trim();
+          const p = String(parts.slice(1).join(":") || "").trim();
+          if (h && p) {
+            const hits = list.filter(x => String(x.host || "").trim() === h && String(x.port || "").trim() === p);
+            if (hits.length === 1) return parseInt(String(hits[0].proxy_id || hits[0].id || "0"), 10) || 0;
+            if (hits.length > 1) {
+              hits.sort((a, b) => (parseInt(String(a.proxy_id || a.id || 0), 10) || 0) - (parseInt(String(b.proxy_id || b.id || 0), 10) || 0));
+              return parseInt(String(hits[0].proxy_id || hits[0].id || "0"), 10) || 0;
+            }
+          }
+        }
+        if (isIpv4(addr)) {
+          const hitsIp = list.filter(x => String(x.last_ip || "").trim() === addr);
+          if (hitsIp.length === 1) return parseInt(String(hitsIp[0].proxy_id || hitsIp[0].id || "0"), 10) || 0;
+          if (hitsIp.length > 1) {
+            hitsIp.sort((a, b) => (parseInt(String(a.proxy_id || a.id || 0), 10) || 0) - (parseInt(String(b.proxy_id || b.id || 0), 10) || 0));
+            return parseInt(String(hitsIp[0].proxy_id || hitsIp[0].id || "0"), 10) || 0;
+          }
+          const hitsHost = list.filter(x => String(x.host || "").trim() === addr);
+          if (hitsHost.length === 1) return parseInt(String(hitsHost[0].proxy_id || hitsHost[0].id || "0"), 10) || 0;
+          if (hitsHost.length > 1) {
+            hitsHost.sort((a, b) => (parseInt(String(a.proxy_id || a.id || 0), 10) || 0) - (parseInt(String(b.proxy_id || b.id || 0), 10) || 0));
+            return parseInt(String(hitsHost[0].proxy_id || hitsHost[0].id || "0"), 10) || 0;
+          }
+        }
+        return 0;
+      }
+
+      function getCurrentTaskTypeProxyBindingCounts(spacePk, proxyItems = null) {
+        const spk = parseInt(String(spacePk || "0"), 10) || 0;
+        const items = normalizeProxies(proxyItems || proxiesCache.get(spk) || []);
+        const counts = {};
+        (state.mappings || []).forEach(m => {
+          const mSpk = parseInt(String(m?.space_pk || "0"), 10) || 0;
+          if (spk > 0 && mSpk !== spk) return;
+          let pid = parseInt(String(m?.proxy_id || "0"), 10) || 0;
+          // 兼容老数据：proxy_id=0 但 proxy_addr 实际命中本地代理列表时，也计入当前任务类型的该代理绑定数。
+          if (pid <= 0 && m?.proxy_addr) pid = inferProxyIdByAddrFromItems(m.proxy_addr, items);
+          if (pid <= 0) return;
+          counts[String(pid)] = (Number(counts[String(pid)] || 0) || 0) + 1;
+        });
+        return counts;
+      }
+
+      function withCurrentTaskTypeBindingCounts(spacePk, proxyItems) {
+        const items = normalizeProxies(proxyItems || []);
+        const counts = getCurrentTaskTypeProxyBindingCounts(spacePk, items);
+        return items.map(p => {
+          const pid = p?.proxy_id ?? p?.id ?? 0;
+          const c = counts[String(pid)] ?? counts[pid] ?? 0;
+          return { ...p, binding_count: c };
+        });
+      }
+
       async function loadProxyBindings(spacePk) {
         const r = await adminFetch(`/api/admin/spaces/${spacePk}/proxy-bindings`);
         if (!r) return {};
@@ -1136,9 +1198,9 @@
         if (proxyBindingsRefreshInflight.has(spk)) return proxyBindingsRefreshInflight.get(spk);
         const p = (async () => {
           try {
-            const counts = await loadProxyBindings(spk);
             const arr = proxiesCache.get(spk) || [];
             if (!Array.isArray(arr) || !arr.length) return;
+            const counts = getCurrentTaskTypeProxyBindingCounts(spk, arr);
             arr.forEach(it => {
               const pid = it?.proxy_id ?? it?.id ?? 0;
               const c = counts && typeof counts === "object" ? (counts[String(pid)] ?? counts[pid] ?? 0) : 0;
@@ -1160,17 +1222,7 @@
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || "读取本地代理失败");
         const items = d.proxies || [];
-        let counts = {};
-        try {
-          counts = await loadProxyBindings(spacePk);
-        } catch {
-          counts = {};
-        }
-        const merged = (Array.isArray(items) ? items : []).map(p => {
-          const pid = p?.proxy_id ?? p?.id ?? 0;
-          const c = counts && typeof counts === "object" ? (counts[String(pid)] ?? counts[pid] ?? 0) : 0;
-          return { ...p, binding_count: c };
-        });
+        const merged = withCurrentTaskTypeBindingCounts(spacePk, items);
         proxiesCache.set(spacePk, merged);
         return merged;
       }
@@ -1215,7 +1267,7 @@
 
       function fillProxySelectsCached(spacePk) {
         const successCounts = proxySuccessCountsCache.get(spacePk) || {};
-        const items = normalizeProxies(proxiesCache.get(spacePk) || []);
+        const items = withCurrentTaskTypeBindingCounts(spacePk, proxiesCache.get(spacePk) || []);
         const { ordered: available } = buildProxyDisplayOrder(items);
         const selects = document.querySelectorAll(`select[data-role="proxySelect"][data-space_pk="${spacePk}"]`);
         selects.forEach(sel => {
@@ -1300,7 +1352,7 @@
 
       function fillProxyDisplaysCached(spacePk) {
         const successCounts = proxySuccessCountsCache.get(spacePk) || {};
-        const items = normalizeProxies(proxiesCache.get(spacePk) || []);
+        const items = withCurrentTaskTypeBindingCounts(spacePk, proxiesCache.get(spacePk) || []);
         const { ordered: available, rankByProxyId } = buildProxyDisplayOrder(items);
         const spans = document.querySelectorAll(`span[data-role="proxyDisplay"][data-space_pk="${spacePk}"]`);
         spans.forEach(span => {
@@ -3461,7 +3513,7 @@
         const titleEl = document.getElementById("dataTransferTitle");
         const hintEl = document.getElementById("dataTransferHint");
         if (idEl) idEl.value = String(mappingId);
-        if (textEl) textEl.value = "";
+        if (textEl) textEl.value = lsGet(LS_KEYS.dataTransferText) || "";
         if (titleEl) titleEl.textContent = `传输数据 - #${m.window_sort_num ?? m.window_pk ?? mappingId} ${m.window_name || ""}`.trim();
         if (hintEl) hintEl.textContent = "请输入任意要发送到该浏览器插件数据面板的信息。每行会单独显示和复制。";
         dataTransferModal.show();
@@ -3481,6 +3533,7 @@
         }
         const btn = document.getElementById("btnSendDataTransfer");
         try {
+          lsSet(LS_KEYS.dataTransferText, text);
           setBtnBusy(btn, true, { loadingText: "传输中", keepWidth: true });
           if (currentDataTransferBtn) setBtnBusy(currentDataTransferBtn, true, { loadingText: "", keepWidth: false });
           const lines = text.split(/\r?\n/);
@@ -4457,7 +4510,7 @@
           if (closeBtn) closeBtn.disabled = true;
           if (veoConnectBringBtn) veoConnectBringBtn.disabled = true;
 
-          // await clearMappingBrowserLocalCache(mappingId);
+          //await clearMappingBrowserLocalCache(mappingId);
           setBtnBusy(openBtn, true, { loadingText: "打开中" });
           const hl = getMappingHeadless(mappingId);
           const pm = getMappingPureMode(mappingId);
@@ -4954,6 +5007,9 @@
       document.getElementById("btnTransferMapping")?.addEventListener("click", transferMappingToOtherType);
       document.getElementById("btnRollbackMapping")?.addEventListener("click", rollbackMappingToOtherType);
       document.getElementById("btnSendDataTransfer")?.addEventListener("click", submitDataTransfer);
+      document.getElementById("dataTransferText")?.addEventListener("input", (e) => {
+        lsSet(LS_KEYS.dataTransferText, String(e.target?.value || ""));
+      });
       document.getElementById("mapTransferTypeId")?.addEventListener("change", (e) => {
         const id = parseInt(String(e.target?.value || ""), 10);
         if (!Number.isNaN(id) && id > 0) lsSet(LS_KEYS.transferTargetTypeId, String(id));
@@ -5040,23 +5096,6 @@
             }
           } catch {}
 
-          // 尽量在前端即时更新缓存中的“绑定数”，让下拉标签立刻反映变化
-          try {
-            if (oldProxyId !== proxyId && proxiesCache.has(spacePk)) {
-              const arr = proxiesCache.get(spacePk) || [];
-              const bump = (pid, delta) => {
-                const it = arr.find(x => String(x?.proxy_id ?? x?.id ?? "") === String(pid));
-                if (!it) return;
-                const cur = Number(it.binding_count ?? it.bindingCount ?? 0) || 0;
-                it.binding_count = Math.max(0, cur + delta);
-              };
-              bump(oldProxyId, -1);
-              bump(proxyId, +1);
-              proxiesCache.set(spacePk, arr);
-              fillProxyControlsCached(spacePk);
-            }
-          } catch {}
-
           // 同步 state（用于后续刷新/渲染时更准确地显示当前代理）
           try {
             const m = (state.mappings || []).find(x => String(x?.id || "") === String(mid));
@@ -5072,7 +5111,7 @@
             }
           } catch {}
 
-          // 重新拉取该 space_pk 的“真实绑定数”，再刷新下拉（保证数字实时）
+          // 基于当前任务类型的窗口绑定列表重新统计代理绑定数（不统计其它任务类型）。
           try {
             await refreshProxyBindingCounts(spacePk);
             fillProxyControlsCached(spacePk);

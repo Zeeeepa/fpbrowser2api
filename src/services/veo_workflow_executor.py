@@ -19,6 +19,8 @@ import json
 import mimetypes
 import os
 import random
+import shutil
+import subprocess
 from math import gcd
 import re
 import socket
@@ -90,7 +92,7 @@ def _veo_env_enabled(name: str, default: bool = True) -> bool:
 _VEO_LOCAL_IMAGE_CACHE_SUBDIR = "veo_image_cache"
 _VEO_LOCAL_IMAGE_CACHE_DIR = STATIC_DIR / "assets" / _VEO_LOCAL_IMAGE_CACHE_SUBDIR
 _VEO_LOCAL_IMAGE_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(
-    _veo_int_env("VEO_LOCAL_IMAGE_DOWNLOAD_CONCURRENCY", 50, min_value=1, max_value=64)
+    _veo_int_env("VEO_LOCAL_IMAGE_DOWNLOAD_CONCURRENCY", 100, min_value=1, max_value=64)
 )
 _VEO_LOCAL_IMAGE_LOCKS: Dict[str, asyncio.Lock] = {}
 _VEO_LOCAL_IMAGE_LOCKS_GUARD = asyncio.Lock()
@@ -107,6 +109,99 @@ def _veo_local_image_cache_max_bytes() -> int:
 
 def _veo_local_image_max_bytes() -> int:
     return _veo_int_env("VEO_LOCAL_IMAGE_MAX_BYTES", 20 * 1024 * 1024, min_value=1 * 1024 * 1024, max_value=1024 * 1024 * 1024)
+
+
+def _veo_local_video_max_bytes() -> int:
+    return _veo_int_env("VEO_LOCAL_VIDEO_MAX_BYTES", 100 * 1024 * 1024, min_value=1 * 1024 * 1024, max_value=100 * 1024 * 1024)
+
+
+def _veo_local_image_min_download_bps() -> float:
+    """输入图本地化下载最低平均速度；<=0 表示不做慢速检测。"""
+    return _veo_float_env("VEO_LOCAL_IMAGE_MIN_DOWNLOAD_BPS", 16 * 1024, min_value=0.0, max_value=1024 * 1024 * 1024)
+
+
+def _veo_local_video_min_download_bps() -> float:
+    """输入视频本地化下载最低平均速度；<=0 表示不做慢速检测。"""
+    return _veo_float_env("VEO_LOCAL_VIDEO_MIN_DOWNLOAD_BPS", 64 * 1024, min_value=0.0, max_value=1024 * 1024 * 1024)
+
+
+def _veo_local_download_speed_grace_seconds(kind: str) -> float:
+    is_video = str(kind or "").lower() == "video"
+    return _veo_float_env(
+        "VEO_LOCAL_VIDEO_DOWNLOAD_SPEED_GRACE_SECONDS" if is_video else "VEO_LOCAL_IMAGE_DOWNLOAD_SPEED_GRACE_SECONDS",
+        15.0 if is_video else 10.0,
+        min_value=1.0,
+        max_value=600.0,
+    )
+
+
+def _veo_raise_if_local_download_too_slow(
+    *,
+    kind: str,
+    total: int,
+    started_at: float,
+    source_url: str,
+) -> None:
+    """按下载开始后的平均速度识别“持续很慢”的输入素材下载。"""
+    is_video = str(kind or "").lower() == "video"
+    min_bps = _veo_local_video_min_download_bps() if is_video else _veo_local_image_min_download_bps()
+    if min_bps <= 0:
+        return
+    elapsed = max(0.0, time.monotonic() - float(started_at or 0.0))
+    grace = _veo_local_download_speed_grace_seconds("video" if is_video else "image")
+    if elapsed < grace:
+        return
+    avg_bps = float(total or 0) / max(elapsed, 0.001)
+    if avg_bps < min_bps:
+        label = "视频" if is_video else "图片"
+        raise NonPenalizedTaskError(
+            f"VEO 输入{label}本地下载过慢：avg_speed={avg_bps:.0f} B/s < min_speed={min_bps:.0f} B/s; "
+            f"elapsed={elapsed:.1f}s; downloaded={int(total or 0)} bytes; url={safe_trim(source_url, 500)}",
+            status_code=408,
+            content_violation=True,
+        )
+
+
+def _veo_local_download_headers(kind: str, source_url: str) -> Dict[str, str]:
+    """Headers for downloading user supplied media into the local VEO cache.
+
+    Some public image CDNs (notably Wikimedia) reject malformed/generic bot-like
+    user agents.  Use a normal browser UA by default, while still allowing ops to
+    set a policy-compliant UA with contact information via environment variables.
+    """
+    is_video = str(kind or "").lower() == "video"
+    default_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+    )
+    host = (urlparse(source_url).hostname or "").lower()
+    is_wikimedia = host == "wikimedia.org" or host.endswith(".wikimedia.org")
+    # Wikimedia 的 robot policy 拦截比较敏感；生产环境里如果配置了较短/像 bot 的 UA，
+    # 仍可能被 403。对 Wikimedia 默认强制使用完整浏览器 UA；只有显式
+    # VEO_LOCAL_WIKIMEDIA_USER_AGENT 才覆盖。
+    if is_wikimedia:
+        ua = os.getenv("VEO_LOCAL_WIKIMEDIA_USER_AGENT", "").strip() or default_ua
+    else:
+        ua = (
+            os.getenv("VEO_LOCAL_VIDEO_USER_AGENT" if is_video else "VEO_LOCAL_IMAGE_USER_AGENT", "").strip()
+            or os.getenv("VEO_LOCAL_DOWNLOAD_USER_AGENT", "").strip()
+            or default_ua
+        )
+    headers = {
+        "Accept": "video/*,application/octet-stream,*/*;q=0.8"
+        if is_video
+        else "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "User-Agent": ua,
+    }
+    referer = os.getenv("VEO_LOCAL_DOWNLOAD_REFERER", "").strip()
+    if not referer and is_wikimedia:
+        referer = "https://commons.wikimedia.org/"
+    if referer:
+        headers["Referer"] = referer
+    if is_wikimedia:
+        headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+    return headers
 
 
 def _veo_payload_flag_is_false(v: Any) -> bool:
@@ -176,6 +271,115 @@ def _veo_is_local_asset_url(raw: str) -> bool:
         return False
 
 
+def _veo_local_asset_path_from_url(raw: str) -> Optional[Path]:
+    """把 `/assets/veo_image_cache/<name>` 的本地化 URL 还原为缓存文件路径。"""
+    try:
+        u = urlparse(str(raw or "").strip())
+        prefix = f"/assets/{_VEO_LOCAL_IMAGE_CACHE_SUBDIR}/"
+        if not u.path.startswith(prefix):
+            return None
+        name = unquote(u.path[len(prefix) :]).strip()
+        if not name or "/" in name or "\\" in name:
+            return None
+        p = (_VEO_LOCAL_IMAGE_CACHE_DIR / name).resolve()
+        base = _VEO_LOCAL_IMAGE_CACHE_DIR.resolve()
+        if base not in p.parents and p != base:
+            return None
+        return p if p.exists() else None
+    except Exception:
+        return None
+
+
+def _veo_parse_ffprobe_rate(raw: Any) -> float:
+    s = str(raw or "").strip()
+    if not s or s in {"0/0", "N/A"}:
+        return 0.0
+    try:
+        if "/" in s:
+            a, b = s.split("/", 1)
+            den = float(b)
+            return (float(a) / den) if den else 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+async def _veo_probe_local_video_metadata(path: Path) -> Dict[str, Any]:
+    """用 ffprobe 读取本地参考视频元数据；只读本地缓存文件，通常几十毫秒，快于浏览器解码抽帧。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+
+    def _run() -> Dict[str, Any]:
+        cp = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if cp.returncode != 0:
+            return {}
+        try:
+            info = json.loads(cp.stdout or "{}")
+        except Exception:
+            return {}
+        stream = (info.get("streams") or [{}])[0] or {}
+        fmt = info.get("format") or {}
+        duration = 0.0
+        for v in (stream.get("duration"), fmt.get("duration")):
+            try:
+                duration = float(v)
+                if duration > 0:
+                    break
+            except Exception:
+                pass
+        fps = _veo_parse_ffprobe_rate(stream.get("avg_frame_rate")) or _veo_parse_ffprobe_rate(stream.get("r_frame_rate"))
+        frame_count = 0
+        try:
+            frame_count = int(float(stream.get("nb_frames") or 0))
+        except Exception:
+            frame_count = 0
+        if frame_count <= 0 and duration > 0 and fps > 0:
+            frame_count = int(round(duration * fps))
+        out: Dict[str, Any] = {"duration_seconds": duration, "fps": fps, "frame_count": frame_count}
+        if frame_count > 0:
+            if frame_count > 241:
+                frame_count = 241
+            # VEO 的 videoInput 使用 0 起始 frame index，因此结束帧取最后一帧下标。
+            out["end_frame_index"] = max(0, frame_count - 1)
+        return out
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception:
+        return {}
+
+
+def _veo_assert_reference_video_duration(meta: Dict[str, Any], *, source: str) -> None:
+    try:
+        duration = float(meta.get("duration_seconds") or meta.get("duration") or 0)
+    except Exception:
+        duration = 0.0
+    if duration > 30.0 + 1e-3:
+        raise NonPenalizedTaskError(
+            f"VEO 参考视频时长不能超过30秒，当前约 {duration:.3f} 秒，违规：{safe_trim(source, 300)}",
+            status_code=400,
+            content_violation=True,
+        )
+
+
 def _veo_image_ext_from_mime_or_url(content_type: str = "", source_url: str = "") -> str:
     ct = (content_type or "").split(";", 1)[0].strip().lower()
     fixed = {
@@ -200,6 +404,30 @@ def _veo_image_ext_from_mime_or_url(content_type: str = "", source_url: str = ""
     except Exception:
         pass
     return ".jpg"
+
+
+def _veo_video_ext_from_mime_or_url(content_type: str = "", source_url: str = "") -> str:
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    fixed = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+        "video/ogg": ".ogv",
+        "video/x-msvideo": ".avi",
+    }
+    if ct in fixed:
+        return fixed[ct]
+    guessed = mimetypes.guess_extension(ct) if ct else ""
+    if guessed:
+        return ".mov" if guessed == ".qt" else guessed
+    try:
+        suffix = Path(urlparse(source_url or "").path).suffix.lower()
+        if suffix in {".mp4", ".mov", ".webm", ".mkv", ".ogv", ".avi", ".m4v"}:
+            return suffix
+    except Exception:
+        pass
+    return ".mp4"
 
 
 def _veo_sniff_image_mime(data: bytes) -> str:
@@ -239,8 +467,92 @@ def _veo_validate_image_bytes(head: bytes, *, content_type: str, source_label: s
             "VEO 输入图片本地下载失败：下载结果不像图片；"
             f"content_type={declared or 'unknown'}; first_bytes={sample}; source={safe_trim(source_label, 300)}",
             status_code=400,
+            content_violation=True,
         )
     return declared
+
+
+def _veo_wikimedia_original_url(source_url: str) -> str:
+    """Convert Wikimedia thumbnail URLs to the original file URL when possible."""
+    try:
+        parsed = urlparse(source_url)
+        host = (parsed.hostname or "").lower()
+        if host != "upload.wikimedia.org":
+            return ""
+        m = re.match(r"^(/wikipedia/commons)/thumb/([0-9a-f]/[0-9a-f]{2}/[^/]+)/[^/]+$", parsed.path, flags=re.I)
+        if not m:
+            return ""
+        original_path = f"{m.group(1)}/{m.group(2)}"
+        return parsed._replace(path=original_path, query="", fragment="").geturl()
+    except Exception:
+        return ""
+
+
+def _veo_special_filepath_url(source_url: str) -> str:
+    """Build a commons.wikimedia.org Special:FilePath fallback URL from an upload URL."""
+    try:
+        parsed = urlparse(source_url)
+        host = (parsed.hostname or "").lower()
+        if host != "upload.wikimedia.org":
+            return ""
+        parts = [unquote(p) for p in parsed.path.split("/") if p]
+        if not parts:
+            return ""
+        # thumb URLs end with ".../<original filename>/<thumbnail filename>".
+        filename = parts[-2] if "thumb" in parts and len(parts) >= 2 else parts[-1]
+        if not filename:
+            return ""
+        query = ""
+        m = re.match(r"^(\d+)px-", parts[-1] or "", flags=re.I)
+        if m:
+            query = urlencode({"width": m.group(1)})
+        return f"https://commons.wikimedia.org/wiki/Special:FilePath/{quote(filename)}" + (f"?{query}" if query else "")
+    except Exception:
+        return ""
+
+
+def _veo_local_download_fallback_urls(source_url: str) -> List[str]:
+    """Alternative URLs for public media hosts that may block a specific edge URL."""
+    out: List[str] = []
+    for candidate in (_veo_wikimedia_original_url(source_url), _veo_special_filepath_url(source_url)):
+        if candidate and candidate != source_url and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _veo_sniff_video_mime(data: bytes) -> str:
+    b = bytes(data or b"")[:64]
+    if len(b) >= 12 and b[4:8] == b"ftyp":
+        return "video/mp4"
+    if b.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    if b.startswith(b"RIFF") and len(b) >= 12 and b[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    if b.startswith(b"OggS"):
+        return "video/ogg"
+    return ""
+
+
+def _veo_validate_video_bytes(head: bytes, *, content_type: str, source_label: str) -> str:
+    declared = (content_type or "").split(";", 1)[0].strip().lower()
+    sniffed = _veo_sniff_video_mime(head)
+    if sniffed:
+        return declared if declared.startswith("video/") else sniffed
+    bad_declared = declared.startswith("text/") or declared in {
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/problem+json",
+    }
+    if bad_declared or (declared and not declared.startswith("video/") and declared != "application/octet-stream"):
+        sample = bytes(head or b"")[:32].hex()
+        raise NonPenalizedTaskError(
+            "参考视频读取失败：请确保视频为mp4格式的视频；"
+            f"content_type={declared or 'unknown'}; first_bytes={sample}; source={safe_trim(source_label, 300)}",
+            status_code=400,
+            content_violation=True,
+        )
+    return declared or "video/mp4"
 
 
 def _veo_cached_image_for_key(cache_key: str) -> Optional[Path]:
@@ -322,6 +634,7 @@ async def _veo_write_bytes_to_local_image_cache(data: bytes, *, content_type: st
         raise NonPenalizedTaskError(
             f"VEO 输入图片过大：{len(data)} bytes > limit={max_bytes} source={safe_trim(source_label, 300)!r}",
             status_code=413,
+            content_violation=True,
         )
     cache_key = hashlib.sha256(data).hexdigest()
     lock = await _veo_local_image_lock(f"bytes:{cache_key}")
@@ -361,16 +674,14 @@ async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
         content_type = ""
         final_url = source_url
         head = bytearray()
+        download_started_at = time.monotonic()
         timeout = httpx.Timeout(
             connect=_veo_float_env("VEO_LOCAL_IMAGE_CONNECT_TIMEOUT_SECONDS", 15.0, min_value=1.0, max_value=120.0),
             read=_veo_float_env("VEO_LOCAL_IMAGE_READ_TIMEOUT_SECONDS", 180.0, min_value=5.0, max_value=1800.0),
             write=30.0,
             pool=30.0,
         )
-        headers = {
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 FPBrowser2API local image cache",
-        }
+        headers = _veo_local_download_headers("image", source_url)
         try:
             async with _VEO_LOCAL_IMAGE_DOWNLOAD_SEMAPHORE:
                 async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
@@ -385,20 +696,29 @@ async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
                             raise NonPenalizedTaskError(
                                 f"VEO 输入图片本地下载失败：Request Method: GET; url={safe_trim(source_url, 500)}; Status Code: {status}; response={body}",
                                 status_code=400 if status < 500 else 502,
+                                content_violation=True,
                             )
                         cl = str(resp.headers.get("content-length") or "").strip()
                         if cl.isdigit() and int(cl) > max_bytes:
                             raise NonPenalizedTaskError(
                                 f"VEO 输入图片过大：content-length={cl} > limit={max_bytes}; url={safe_trim(source_url, 500)}",
                                 status_code=413,
+                                content_violation=True,
                             )
                         content_type = str(resp.headers.get("content-type") or "")
                         final_url = str(resp.url or source_url)
+                        download_started_at = time.monotonic()
                         with tmp.open("wb") as f:
                             async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                                 if not chunk:
                                     continue
                                 total += len(chunk)
+                                _veo_raise_if_local_download_too_slow(
+                                    kind="image",
+                                    total=total,
+                                    started_at=download_started_at,
+                                    source_url=source_url,
+                                )
                                 if total > max_bytes:
                                     raise NonPenalizedTaskError(
                                         f"VEO 输入图片过大：downloaded={total} > limit={max_bytes}; url={safe_trim(source_url, 500)}",
@@ -411,6 +731,7 @@ async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
                 raise NonPenalizedTaskError(
                     f"VEO 输入图片本地下载失败：空响应；Request Method: GET; url={safe_trim(source_url, 500)}",
                     status_code=502,
+                    content_violation=True,
                 )
             effective_type = _veo_validate_image_bytes(bytes(head), content_type=content_type, source_label=source_url)
             ext = _veo_image_ext_from_mime_or_url(effective_type, final_url)
@@ -424,6 +745,132 @@ async def _veo_download_url_to_local_image_cache(source_url: str) -> Path:
             raise NonPenalizedTaskError(
                 f"VEO 输入图片本地下载失败：Request Method: GET; url={safe_trim(source_url, 500)}; error={safe_trim(str(e), 500)}",
                 status_code=502,
+                content_violation=True,
+            ) from e
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+
+async def _veo_write_bytes_to_local_video_cache(data: bytes, *, content_type: str, source_label: str) -> Path:
+    max_bytes = _veo_local_video_max_bytes()
+    if len(data) > max_bytes:
+        raise NonPenalizedTaskError(
+            f"VEO 输入视频过大：{len(data)} bytes > limit={max_bytes} source={safe_trim(source_label, 300)!r}",
+            status_code=413,
+            content_violation=True,
+        )
+    cache_key = hashlib.sha256(data).hexdigest()
+    lock = await _veo_local_image_lock(f"video-bytes:{cache_key}")
+    async with lock:
+        cached = _veo_cached_image_for_key(cache_key)
+        if cached:
+            return cached
+        _VEO_LOCAL_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        effective_type = _veo_validate_video_bytes(data[:4096], content_type=content_type, source_label=source_label)
+        ext = _veo_video_ext_from_mime_or_url(effective_type, source_label)
+        final = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}{ext}"
+        tmp = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}.{uuid.uuid4().hex}.tmp"
+        try:
+            await asyncio.to_thread(tmp.write_bytes, data)
+            await asyncio.to_thread(tmp.replace, final)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+        return final
+
+
+async def _veo_download_url_to_local_video_cache(source_url: str) -> Path:
+    cache_key = hashlib.sha256(source_url.encode("utf-8", "ignore")).hexdigest()
+    lock = await _veo_local_image_lock(f"video-url:{cache_key}")
+    async with lock:
+        cached = _veo_cached_image_for_key(cache_key)
+        if cached:
+            return cached
+        _VEO_LOCAL_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        max_bytes = _veo_local_video_max_bytes()
+        tmp = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}.{uuid.uuid4().hex}.tmp"
+        total = 0
+        content_type = ""
+        final_url = source_url
+        head = bytearray()
+        download_started_at = time.monotonic()
+        timeout = httpx.Timeout(
+            connect=_veo_float_env("VEO_LOCAL_VIDEO_CONNECT_TIMEOUT_SECONDS", 15.0, min_value=1.0, max_value=120.0),
+            read=_veo_float_env("VEO_LOCAL_VIDEO_READ_TIMEOUT_SECONDS", 600.0, min_value=5.0, max_value=3600.0),
+            write=30.0,
+            pool=30.0,
+        )
+        headers = _veo_local_download_headers("video", source_url)
+        try:
+            async with _VEO_LOCAL_IMAGE_DOWNLOAD_SEMAPHORE:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
+                    async with client.stream("GET", source_url, headers=headers) as resp:
+                        status = int(resp.status_code or 0)
+                        if status >= 400:
+                            body = ""
+                            try:
+                                body = (await resp.aread()).decode("utf-8", "ignore")[:300]
+                            except Exception:
+                                body = ""
+                            raise NonPenalizedTaskError(
+                                f"VEO 输入视频本地下载失败：Request Method: GET; url={safe_trim(source_url, 500)}; Status Code: {status}; response={body}",
+                                status_code=400 if status < 500 else 502,
+                                content_violation=True,
+                            )
+                        cl = str(resp.headers.get("content-length") or "").strip()
+                        if cl.isdigit() and int(cl) > max_bytes:
+                            raise NonPenalizedTaskError(
+                                f"VEO 输入视频过大：content-length={cl} > limit={max_bytes}; url={safe_trim(source_url, 500)}",
+                                status_code=413,
+                                content_violation=True,
+                            )
+                        content_type = str(resp.headers.get("content-type") or "")
+                        final_url = str(resp.url or source_url)
+                        download_started_at = time.monotonic()
+                        with tmp.open("wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                                if not chunk:
+                                    continue
+                                total += len(chunk)
+                                _veo_raise_if_local_download_too_slow(
+                                    kind="video",
+                                    total=total,
+                                    started_at=download_started_at,
+                                    source_url=source_url,
+                                )
+                                if total > max_bytes:
+                                    raise NonPenalizedTaskError(
+                                        f"VEO 输入视频过大：downloaded={total} > limit={max_bytes}; url={safe_trim(source_url, 500)}",
+                                        status_code=413,
+                                    )
+                                if len(head) < 4096:
+                                    head.extend(chunk[: 4096 - len(head)])
+                                await asyncio.to_thread(f.write, chunk)
+            if total <= 0:
+                raise NonPenalizedTaskError(
+                    f"VEO 输入视频本地下载失败：空响应；Request Method: GET; url={safe_trim(source_url, 500)}",
+                    status_code=502,
+                    content_violation=True,
+                )
+            effective_type = _veo_validate_video_bytes(bytes(head), content_type=content_type, source_label=source_url)
+            ext = _veo_video_ext_from_mime_or_url(effective_type, final_url)
+            final = _VEO_LOCAL_IMAGE_CACHE_DIR / f"{cache_key}{ext}"
+            await asyncio.to_thread(tmp.replace, final)
+            return final
+        except NonPenalizedTaskError:
+            raise
+        except Exception as e:
+            raise NonPenalizedTaskError(
+                f"VEO 输入视频本地下载失败：Request Method: GET; url={safe_trim(source_url, 500)}; error={safe_trim(str(e), 500)}",
+                status_code=502,
+                content_violation=True,
             ) from e
         finally:
             try:
@@ -450,6 +897,7 @@ async def _veo_materialize_image_for_extension(
         raise NonPenalizedTaskError(
             f"VEO 输入图片地址协议不支持：仅支持 http/https/data URL，got={safe_trim(raw, 300)!r}",
             status_code=400,
+            content_violation=True,
         )
     await _veo_maybe_cleanup_local_image_cache()
     try:
@@ -468,7 +916,7 @@ async def _veo_materialize_image_for_extension(
     if parsed.scheme.lower() == "data":
         m = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", raw, flags=re.S)
         if not m:
-            raise NonPenalizedTaskError("VEO 输入图片 data URL 格式不支持：仅支持 data:image/...;base64,...", status_code=400)
+            raise NonPenalizedTaskError("VEO 输入图片 data URL 格式不支持：仅支持 data:image/...;base64,...", status_code=400,content_violation=True)
         mime = m.group(1)
         try:
             data = base64.b64decode(m.group(2), validate=False)
@@ -476,7 +924,23 @@ async def _veo_materialize_image_for_extension(
             raise NonPenalizedTaskError(f"VEO 输入图片 data URL 解码失败：{safe_trim(str(e), 300)}", status_code=400) from e
         local_path = await _veo_write_bytes_to_local_image_cache(data, content_type=mime, source_label=f"data:{mime}")
     else:
-        local_path = await _veo_download_url_to_local_image_cache(raw)
+        try:
+            local_path = await _veo_download_url_to_local_image_cache(raw)
+        except NonPenalizedTaskError as first_err:
+            last_err = first_err
+            for alt in _veo_local_download_fallback_urls(raw):
+                append_log(
+                    log_file,
+                    f"[veo][extension][image-cache] primary download failed, try fallback "
+                    f"source={safe_trim(raw, 220)!r} alt={safe_trim(alt, 220)!r} err={safe_trim(str(last_err), 220)!r}",
+                )
+                try:
+                    local_path = await _veo_download_url_to_local_image_cache(alt)
+                    break
+                except NonPenalizedTaskError as e:
+                    last_err = e
+            else:
+                raise first_err
     local_url = _veo_local_asset_url(local_path)
     append_log(
         log_file,
@@ -526,6 +990,61 @@ async def _veo_materialize_image_urls_for_extension(
     return list(await asyncio.gather(*tasks))
 
 
+async def _veo_materialize_video_for_extension(
+    source_url: str,
+    *,
+    kind: str,
+    progress_cb: ProgressCB,
+    log_file: Optional[Path],
+) -> str:
+    raw = str(source_url or "").strip()
+    if not raw or _veo_is_local_asset_url(raw):
+        return raw
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https", "data"}:
+        raise NonPenalizedTaskError(
+            f"VEO 输入视频地址协议不支持：仅支持 http/https/data URL，got={safe_trim(raw, 300)!r}",
+            status_code=400,
+            content_violation=True,
+        )
+    await _veo_maybe_cleanup_local_image_cache()
+    try:
+        await progress_cb(
+            2,
+            {
+                "stage": "localize_input_video",
+                "kind": kind,
+                "index": 1,
+                "total": 1,
+                "source_host": parsed.netloc if parsed.scheme != "data" else "data-url",
+            },
+        )
+    except Exception:
+        pass
+    if parsed.scheme.lower() == "data":
+        m = re.match(r"^data:(video/[a-zA-Z0-9.+-]+|application/octet-stream);base64,(.*)$", raw, flags=re.S)
+        if not m:
+            raise NonPenalizedTaskError("VEO 输入视频 data URL 格式不支持：仅支持 data:video/...;base64,...", status_code=400)
+        mime = m.group(1)
+        try:
+            data = base64.b64decode(m.group(2), validate=False)
+        except Exception as e:
+            raise NonPenalizedTaskError(f"VEO 输入视频 data URL 解码失败：{safe_trim(str(e), 300)}", status_code=400) from e
+        local_path = await _veo_write_bytes_to_local_video_cache(data, content_type=mime, source_label=f"data:{mime}")
+    else:
+        local_path = await _veo_download_url_to_local_video_cache(raw)
+    local_url = _veo_local_asset_url(local_path)
+    append_log(
+        log_file,
+        f"[veo][extension][video-cache] localized kind={kind} source={safe_trim(raw, 260)!r} -> {local_url!r}",
+    )
+    try:
+        await progress_cb(2, {"stage": "localize_input_video_ok", "kind": kind, "index": 1, "total": 1, "url": local_url})
+    except Exception:
+        pass
+    return local_url
+
+
 async def refresh_veo_balance_via_extension(
     *,
     db: Database,
@@ -550,6 +1069,7 @@ async def refresh_veo_balance_via_extension(
 
         access_token = ""
         access_expires = ""
+        current_user_paygate_tier: Optional[str] = None
 
         try:
             mid = int(picked.mapping_id)
@@ -558,6 +1078,7 @@ async def refresh_veo_balance_via_extension(
                 if row:
                     access_token = str(row.get("sora_access_token") or "").strip() or None
                     access_expires = str(row.get("sora_access_expires") or "").strip() or None
+                    current_user_paygate_tier = str(row.get("sora_plan_title") or "").strip() or None
         except Exception as e:
             pass
 
@@ -600,16 +1121,21 @@ async def refresh_veo_balance_via_extension(
             timeout=max(1.0, float(refresh_timeout_seconds or 45.0)) + 5.0,
         )
         if result is not None and result.get("credits") is not None:
-            user_paygate_tier = str(result.get("user_paygate_tier") or result.get("userPaygateTier") or "").strip() or None
+            user_paygate_tier = (
+                str(result.get("user_paygate_tier") or result.get("userPaygateTier") or "").strip()
+                or current_user_paygate_tier
+            )
+            plan_title = veo_format_paygate_tier_label(user_paygate_tier)
             _kw: Dict[str, Any] = {
                 "mapping_id": picked.mapping_id,
                 "remaining_quota": int(result.get("credits") or 0),
                 "sora_remaining_count": int(result.get("credits") or 0),
                 "sora_access_token": access_token,
                 "sora_access_expires": access_expires,
-                "sora_plan_title": user_paygate_tier,
+                "sora_plan_title": plan_title,
             }
-            _kw["cooldown_until"] = str(result.get("cooldown_until") or _veo_local_next_0105_cooldown_str())
+            fallback_cooldown = _veo_local_next_paid_or_free_cooldown_str(user_paygate_tier)
+            _kw["cooldown_until"] = str(result.get("cooldown_until") or fallback_cooldown)
             await db.update_task_type_window(**_kw)
             try:
                 cur_q = int(result.get("credits") or 0)
@@ -733,8 +1259,12 @@ def _short_err_msg(err: Any, *, max_len: int = 120) -> str:
 
 _VEO_CONTENT_VIOLATION_REASON_MESSAGES = {
     "PUBLIC_ERROR_UNSAFE_GENERATION": "视频生成失败，内容包含PUBLIC_ERROR_UNSAFE_GENERATION(不安全的)内容，请手动再试一次。",
+    # Veo 轮询失败时插件会把 mediaStatus.status 写入错误文本；
+    # 该状态包含音频/内容过滤等审核失败（例如 PUBLIC_ERROR_AUDIO_FILTERED）。
+    "MEDIA_GENERATION_STATUS_FAILED": "视频生成失败，内容审核未通过[MEDIA_GENERATION_STATUS_FAILED]",
     # flow/uploadImage 在参考图疑似包含未成年人/儿童照片时返回此 reason。
     "PUBLIC_ERROR_MINOR_UPLOAD": "上传参考图失败，参考图中包含未成年人/儿童照片[PUBLIC_ERROR_MINOR_UPLOAD]",
+    "VEO_REFERENCE_VIDEO_DURATION_VIOLATION": "参考视频时长不能超过30秒",
 }
 
 
@@ -750,6 +1280,69 @@ def _veo_content_violation_reason(err: Any) -> Optional[str]:
         if reason in haystack:
             return reason
     return None
+
+
+def _veo_extract_failure_reasons(err: Any) -> str:
+    """从插件错误信息中提取 VEO 返回的 mediaStatus.failureReasons。
+
+    browser_extension/providers/veo_provider.js 会把失败详情格式化为：
+    ``failureReasons=FINISH_REASON_...``；这里同时兼容 JSON/dict 风格的
+    ``failureReasons`` / ``failure_reasons`` 字段。
+    """
+    values: List[str] = []
+
+    def add(raw: Any) -> None:
+        if raw is None:
+            return
+        if isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                add(item)
+            return
+        s = str(raw or "").strip()
+        if not s:
+            return
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                add(parsed)
+                return
+            except Exception:
+                s = s[1:-1].strip()
+        for part in re.split(r"[,，|]+", s):
+            item = part.strip().strip("\"' ")
+            if item and item not in values:
+                values.append(item)
+
+    for attr in ("failureReasons", "failure_reasons"):
+        try:
+            add(getattr(err, attr, None))
+        except Exception:
+            pass
+
+    try:
+        text = str(err or "")
+    except Exception:
+        text = ""
+    if text:
+        for m in re.finditer(
+            r"['\"]?(?:failureReasons|failure_reasons)['\"]?\s*[:=]\s*(\[[^\]]*\]|[^;\r\n。]+)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            add(m.group(1))
+
+    return ",".join(values)
+
+
+def _veo_content_violation_message(reason: str, err: Any) -> str:
+    if reason == "PUBLIC_ERROR_UNSAFE_GENERATION":
+        failure_reasons = _veo_extract_failure_reasons(err)
+        if failure_reasons:
+            return f"生成失败，内容包含{failure_reasons}内容，请手动再试一次。"
+    return _VEO_CONTENT_VIOLATION_REASON_MESSAGES.get(
+        reason,
+        f"VEO内容审核未通过（{reason}）",
+    )
 
 def _veo_parse_access_expires(raw: Any) -> Optional[datetime]:
     """解析 Labs / NextAuth 返回的 expires（ISO-8601、带 Z、或 SQLite 本地时间串）。"""
@@ -911,7 +1504,13 @@ _VEO_SESSIONS: Dict[str, "VeoSession"] = {}
 
 
 def _veo_key(vendor: str, base_url: str, space_id: str, window_key: str) -> str:
-    return f"veo|{vendor}|{base_url}|{space_id}|{window_key}"
+    return "|".join([
+        "veo",
+        str(vendor or "").strip().lower(),
+        str(base_url or "").strip().rstrip("/").lower(),
+        str(space_id or "").strip(),
+        str(window_key or "").strip(),
+    ])
 
 
 def _drop_veo_session(cache_key: str) -> None:
@@ -2440,10 +3039,27 @@ async def veo_admin_unified_open_or_connect(
     google_login_timeout_ms: int,
     pure_mode: bool = True,
 ) -> Dict[str, Any]:
-    """管理台合并逻辑：Google 登录页且页面可见 @gmail.com → 连接置前（与原 veo-connect-bring 一致）；否则若仍为 Google 登录相关 → 完整开号；其它情况 → 连接置前。"""
-    target_url = "https://accounts.google.com/"
-    gl_ms = int(google_login_timeout_ms)
+    """??? VEO ??/??????????????? Google ??/??/EFA ?????
+
+    ?????????? CDP ?? Playwright ??/? Google ???????????
+    launcher ?? WS ???????????? storage????????????????
+    """
+    from .sora_plus_register_executor import resolve_window_platform_login_creds_optional_efa
+
+    try:
+        gl_ms = int(google_login_timeout_ms)
+    except Exception:
+        gl_ms = 120_000
     gl_ms = max(45_000, min(gl_ms, 240_000))
+
+    creds = await resolve_window_platform_login_creds_optional_efa(db, window_pk=int(window_pk))
+    google_account = str(creds.get("platform_username") or "").strip()
+    google_password = str(creds.get("platform_password") or "")
+    google_efa = str(creds.get("platform_efa") or "").strip()
+    if not google_account or not google_password:
+        raise NonPenalizedTaskError("??????? Google ???????????????", status_code=400)
+
+    target_url = str(default_target_url or "").strip() or "https://labs.google/fx"
     sess = get_or_create_veo_session(
         vendor=browser_vendor,
         base_url=browser_base_url,
@@ -2458,79 +3074,48 @@ async def veo_admin_unified_open_or_connect(
         sess._cancel_idle_close()
     except Exception:
         pass
-    is_google = False
-    has_gmail = False
-    async with sess._bring_drafts_lock:
-        await sess.ensure_open(
-            args=sess.browser_open_args,
-            force_open=sess.browser_force_open,
-            headless=headless,
-            acquire_bring_lock=False,
-        )
-        await sess._bring_target_page_to_front(
-            refresh_target=True,
-            drafts_url=target_url,
-            acquire_bring_lock=False,
-            google_login_db=db,
-            google_login_window_pk=int(window_pk),
-            google_login_timeout_ms=gl_ms,
-        )
-        print("--1");
-        await progress_cb(5, {"stage": "detect_google_page"})
-        is_google, has_gmail = await sess._veo_detect_google_login_and_gmail_visible()
-        print(f"is_google: {is_google}, has_gmail: {has_gmail}")
-        await progress_cb(
-            8,
-            {"stage": "detect_done", "is_google_login": is_google, "has_gmail_visible": has_gmail},
-        )
 
-        if is_google and not has_gmail:
-            need_full_open_account = True
-        elif is_google and has_gmail:
-            need_full_open_account = False
-            await sess._bring_target_page_to_front(
-                refresh_target=False,
-                drafts_url=target_url,
-                acquire_bring_lock=False,
-                google_login_db=db,
-                google_login_window_pk=int(window_pk),
-                google_login_timeout_ms=gl_ms,
-            )
-        else:
-            need_full_open_account = False
-            
+    await progress_cb(3, {"stage": "extension_connect", "target_url": target_url})
+    client = await ensure_extension_connected_via_window(
+        sess=sess,
+        target_url="https://accounts.google.com/",
+        space_id=space_id,
+        window_key=window_key,
+        wait_seconds=10.0,
+        log_file=getattr(sess, "_log_file", None),
+        force_open=getattr(sess, "browser_force_open", None),
+        headless=headless,
+        pure_mode=pure_mode,
+        auto_triger_connection=True,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
+    )
+    if client is None:
+        raise NonPenalizedTaskError(f"?????????space_id={space_id!r} window_key={window_key!r}", status_code=503)
 
-    if need_full_open_account:
-        target_url = str(default_target_url or "").strip() or "https://veo.google.com"
-        out = await veo_flow_open_account(
-            progress_cb,
-            db=db,
-            window_pk=window_pk,
-            browser_vendor=browser_vendor,
-            browser_base_url=browser_base_url,
-            browser_access_key=browser_access_key,
-            space_id=space_id,
-            window_key=window_key,
-            timeout_seconds=timeout_seconds,
-            headless=headless,
-            pure_mode=pure_mode,
-        )
-        if isinstance(out, dict):
-            out = {**out, "branch": "full_open_account"}
-        return out if isinstance(out, dict) else {"ok": True, "branch": "full_open_account", "raw": out}
-
-    await sess.disconnect_playwright_under_bring_lock()
-    branch = "gmail_picker_connect" if (is_google and has_gmail) else "connect_bring_default"
+    await progress_cb(8, {"stage": "google_auto_login_dispatch", "account": google_account})
+    result = await submit_extension_task(
+        space_id=space_id,
+        window_key=window_key,
+        provider="veo",
+        payload={
+            "action": "google_auto_login",
+            "workflow_kind": "google_auto_login",
+            "target_url": target_url,
+            "google_account": google_account,
+            "google_password": google_password,
+            "google_efa": google_efa,
+        },
+        progress_cb=progress_cb,
+        timeout_seconds=max(float(timeout_seconds or 0), float(gl_ms) / 1000.0),
+    )
     return {
         "ok": True,
-        "branch": branch,
-        "is_google_login": is_google,
-        "has_gmail_visible": has_gmail,
-        "message": (
-            "已连接并置前（检测到账号列表含 @gmail.com，已按自动点选/填表处理），已断开自动化连接"
-            if branch == "gmail_picker_connect"
-            else "已连接并置前目标页，已断开自动化连接"
-        ),
+        "branch": "extension_google_auto_login",
+        "target_url": target_url,
+        "message": "????? Google ?????????????? VEO/Flow ???",
+        "result": result,
     }
 
 
@@ -2651,7 +3236,7 @@ class VeoAccessKeepaliveRefresher:
         db: Database,
         stop_event: asyncio.Event,
         signal_window_pool_replenish: Optional[Callable[[], None]] = None,
-        keepalive_margin_seconds: float = 300.0,
+        keepalive_margin_seconds: float = 150.0,
         keepalive_timeout: float = 300.0,
         max_concurrency: int = 20,
     ) -> None:
@@ -2830,7 +3415,7 @@ class VeoAccessKeepaliveRefresher:
         *,
         keepalive_delay_seconds: float,
         token_refresh_delay_seconds: float,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         try:
             mapping_id = int(row.get("mapping_id") or row.get("id") or 0)
         except Exception:
@@ -2851,33 +3436,16 @@ class VeoAccessKeepaliveRefresher:
             delay_seconds=keepalive_delay_seconds,
             job_kind="keepalive",
         )
+
         token_ok = self._schedule_worker(
             row,
             delay_seconds=token_refresh_delay_seconds,
             job_kind="token_refresh",
         )
+
         if not keepalive_ok and not token_ok:
             self._attempted.pop(mapping_id, None)
-        return keepalive_ok, token_ok
-
-    def _schedule_expired_token_refresh(self, row: Dict[str, Any]) -> bool:
-        try:
-            mapping_id = int(row.get("mapping_id") or row.get("id") or 0)
-        except Exception:
-            mapping_id = 0
-        if mapping_id <= 0:
-            return False
-        expires_s = str(row.get("sora_access_expires") or "").strip()
-        if not expires_s:
-            return False
-        prev = self._attempted.get(mapping_id)
-        if prev and prev[0] == expires_s:
-            return False
-        self._attempted[mapping_id] = (expires_s, time.monotonic())
-        ok = self._schedule_worker(row, delay_seconds=0.0, job_kind="token_refresh")
-        if not ok:
-            self._attempted.pop(mapping_id, None)
-        return ok
+        return keepalive_ok,token_ok
 
     async def _sleep_or_stopped(self, delay_seconds: float) -> bool:
         delay = max(0.0, float(delay_seconds or 0.0))
@@ -3083,17 +3651,15 @@ class VeoAccessKeepaliveRefresher:
                     if seconds_left is None:
                         continue
                     if seconds_left <= 0:
-                        if self._schedule_expired_token_refresh(row):
-                            scheduled_expired_token_refresh += 1
                         continue
                     if seconds_left <= schedule_horizon:
                         # 保活任务的理论执行点：expires - margin。
-                        # token 刷新任务：理论保活点 + margin + 10s，等价于 expires + 10s。
-                        # 如果进程启动/扫描时已经进入 margin，保活会立即跑，但刷新仍对齐 expires+10s，
-                        # 避免被错误推迟到 now+margin+10s。
+                        # token 刷新任务：理论保活点 + margin + 30s，等价于 expires + 30s。
+                        # 如果进程启动/扫描时已经进入 margin，保活会立即跑，但刷新仍对齐 expires+50s，
+                        # 避免被错误推迟到 now+margin+30s。
                         intended_keepalive_delay = seconds_left - margin
                         keepalive_delay = max(0.0, intended_keepalive_delay)
-                        token_refresh_delay = max(0.0, intended_keepalive_delay + margin + 10.0)
+                        token_refresh_delay = max(0.0, intended_keepalive_delay + margin + 30.0)
                         keepalive_ok, token_ok = self._schedule_keepalive_with_token_refresh(
                             row,
                             keepalive_delay_seconds=keepalive_delay,
@@ -3361,7 +3927,7 @@ VEO_R2V_MODEL_LANDSCAPE = "veo_3_1_r2v_fast_landscape"
 VEO_R2V_MODEL_PORTRAIT = "veo_3_1_r2v_fast_portrait"
 VEO_T2V_MODEL_FAST_PORTRAIT = "veo_3_1_t2v_fast_portrait"
 VEO_T2V_MODEL_FAST = "veo_3_1_t2v_fast"
-VEO_EXTENSION_ULTRA_BALANCE_THRESHOLD = 160
+VEO_EXTENSION_ULTRA_BALANCE_THRESHOLD = 2000
 VEO_EXTENSION_ULTRA_MODEL_KEYS = {
     VEO_I2V_MODEL_LANDSCAPE_FL,
     VEO_I2V_MODEL_PORTRAIT_FL,
@@ -3412,6 +3978,20 @@ def _veo_collect_ingredients_image_urls(payload: Dict[str, Any]) -> List[str]:
         out.append(u)
     return out
 
+def _veo_collect_ingredients_video_urls(payload: Dict[str, Any]) -> List[str]:
+    """Ingredients/R2V 视频参考 URL，最多 1 个。
+
+    业务入口只允许从 payload.video_url 读取参考视频；不要从其它
+    ingredients/reference 字段兼容解析，避免误把结果视频地址等字段当成参考视频。
+    """
+    payload = payload or {}
+    if "video_url" not in payload or payload.get("video_url") is None:
+        return []
+    video_url = str(payload.get("video_url") or "").strip()
+    if not video_url:
+        return []
+    return [video_url]
+
 
 def _veo_resolve_r2v_model(payload: Dict[str, Any]) -> tuple[str, str]:
     """R2V videoModelKey + aspectRatio，与 generation_handler 中 veo_3_1_r2v_fast* 一致。"""
@@ -3444,12 +4024,12 @@ def _veo_collect_i2v_image_urls(payload: Dict[str, Any]) -> List[str]:
     imgs = payload.get("images")
     if isinstance(imgs, list) and len(imgs) > 0:
         if len(imgs) > 2:
-            raise NonPenalizedTaskError("图生视频最多支持 2 张图片（首帧与尾帧）", status_code=400)
+            raise NonPenalizedTaskError("图生视频最多支持 2 张图片（首帧与尾帧）", status_code=400, content_violation=True)
         out: List[str] = []
         for it in imgs:
             u = _veo_extract_url_from_image_item(it)
             if not u:
-                raise NonPenalizedTaskError("images 数组中存在无法解析的图片地址", status_code=400)
+                raise NonPenalizedTaskError("images 数组中存在无法解析的图片地址", status_code=400, content_violation=True)
             out.append(u)
         return out
 
@@ -3594,12 +4174,15 @@ def veo_format_paygate_tier_label(tier: Optional[str]) -> str:
     """将 userPaygateTier 转为可读套餐名（与 flow2api manage.html formatAccountType 一致）。"""
     t = str(tier or "").strip()
     if not t or t == "PAYGATE_TIER_NOT_PAID":
-        return "Google Labs · 普通"
+        # free账号
+        return "0" 
     if t == "PAYGATE_TIER_ONE":
-        return "Google Labs · Pro"
+        # pro账号
+        return "1"
     if t == "PAYGATE_TIER_TWO":
-        return "Google Labs · Ult"
-    return f"Google Labs · {t}"
+        # ultra账号
+        return "2"
+    return "-1" #其它类型
 
 
 def _veo_normalize_credits_payload(data: Any) -> Dict[str, Any]:
@@ -3616,19 +4199,28 @@ def _veo_normalize_credits_payload(data: Any) -> Dict[str, Any]:
         tier_s = None
     return {"credits": credits_i, "user_paygate_tier": tier_s, "raw": data}
 
-def _veo_local_next_1305_datetime() -> datetime:
+def _veo_local_next_1505_datetime() -> datetime:
     """本地「下一次 01:05」：当前时刻若已过当天 01:05 则为明天 01:05，否则为今天 01:05。"""
     now = datetime.now()
-    today_0105 = now.replace(hour=1, minute=5, second=0, microsecond=0)
-    if now > today_0105:
+    today_0305 = now.replace(hour=3, minute=5, second=0, microsecond=0)
+    if now > today_0305:
         nd = now.date() + timedelta(days=1)
-        return datetime(nd.year, nd.month, nd.day, 1, 5, 0)
-    return today_0105
+        return datetime(nd.year, nd.month, nd.day, 3, 5, 0)
+    return today_0305
 
 
-def _veo_local_next_0105_cooldown_str() -> str:
+def _veo_local_next_0305_cooldown_str() -> str:
     """VEO 余额接口不返回到期时间时，按本地北京时间下一次 01:05:00 作为 cooldown_until。"""
-    return _veo_local_next_1305_datetime().strftime("%Y-%m-%d %H:%M:%S")
+    return _veo_local_next_1505_datetime().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _veo_local_next_paid_or_free_cooldown_str(user_paygate_tier: Optional[str]) -> str:
+    """余额接口不返回到期时间时：普通账号用下一次 03:05，付费会员用 7 天后的同一时间。"""
+    tier = str(user_paygate_tier or "").strip()
+    dt = _veo_local_next_1505_datetime()
+    if tier and tier != PAYGATE_TIER_NOT_PAID:
+        dt = dt + timedelta(days=7)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _veo_parse_proxy_url(proxy_url: str) -> Dict[str, str]:
@@ -3886,7 +4478,7 @@ async def veo_fetch_credits_by_proxy(
     if int(status or 0) >= 400:
         raise RuntimeError(f"查询 credits 失败：HTTP {status} {safe_trim(body_text, 400)}")
     out = _veo_normalize_credits_payload(obj)
-    out["cooldown_until"] = _veo_local_next_0105_cooldown_str()
+    out["cooldown_until"] = _veo_local_next_0305_cooldown_str()
     return out
 
 
@@ -3974,6 +4566,9 @@ async def veo_fetch_access_tokens_via_extension(
     session_token: Optional[str] = None,
     short_access_token: Optional[str] = None,
     short_expires: Optional[str] = None,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Dict[str, Any]:
     """通过浏览器插件读取 VEO long session-token 与 short access_token。"""
     sid, wkey = _veo_extension_ids_from_session(sess, space_id=space_id, window_key=window_key)
@@ -3986,6 +4581,9 @@ async def veo_fetch_access_tokens_via_extension(
         wait_seconds=connect_wait_seconds,
         log_file=log_file,
         auto_triger_connection = auto_triger_connection,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
     )
     if client is None:
         raise NonPenalizedTaskError(
@@ -4069,6 +4667,9 @@ async def force_fetch_access_token_in_window(
     *,
     sess: "VeoSession",
     target_url: str,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Dict[str, Any]:
     """通过浏览器插件读取长效 Cookie token；必要时先用带 fpb_* URL 触发 WS。"""
     sess._cancel_idle_close()
@@ -4078,6 +4679,9 @@ async def force_fetch_access_token_in_window(
         connect_wait_seconds=8.0,
         token_timeout_seconds=45.0,
         log_file=Path(sess.monitor_log_path) if sess.monitor_log_path else MONITOR_LOG_FILE,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
     )
     return {
         "access_token": str((info or {}).get("short_access_token") or (info or {}).get("access_token") or "").strip() or None,
@@ -4269,51 +4873,52 @@ async def veo_create_flow_project_in_window(
     title: str,
     tool_name: str = "PINHOLE",
 ) -> str:
-    """在指纹浏览器页面内调用 Flow `project.createProject`（与 flow2api flow_client.create_project 等价，走 Cookie）。"""
+    """通过浏览器插件在指纹窗口内调用 Flow `project.createProject`。"""
     title = str(title or "").strip()
     if not title:
         raise RuntimeError("项目标题不能为空")
     tn = str(tool_name or "PINHOLE").strip() or "PINHOLE"
     sess._cancel_idle_close()
-    async with sess._bring_drafts_lock:
-        await sess.ensure_open(args=sess.browser_open_args, force_open=sess.browser_force_open, headless=sess.browser_headless, acquire_bring_lock=False)
-        await sess._bring_target_page_to_front(refresh_target=False, drafts_url=target_url, acquire_bring_lock=False)
-        if sess.pw_ctx.page is None:
-            raise RuntimeError("page 未初始化")
-
-        log_file = Path(sess.monitor_log_path) if sess.monitor_log_path else (MONITOR_LOG_FILE)
-        url = _veo_trpc_create_project_url(target_url)
-        json_data = {"json": {"projectTitle": title, "toolName": tn}}
-
-        tx = await page_fetch_json(
-            sess.pw_ctx.page,
-            url=url,
-            method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json_data=json_data,
-            log_file=log_file,
+    sid, wkey = _veo_extension_ids_from_session(sess)
+    log_file = Path(sess.monitor_log_path) if sess.monitor_log_path else MONITOR_LOG_FILE
+    client = await ensure_extension_connected_via_window(
+        sess=sess,
+        target_url=target_url,
+        space_id=sid,
+        window_key=wkey,
+        wait_seconds=8.0,
+        log_file=log_file,
+        auto_triger_connection=True,
+    )
+    if client is None:
+        raise NonPenalizedTaskError(
+            f"浏览器插件未连接：space_id={sid!r} window_key={wkey!r}",
+            status_code=503,
         )
-        st = tx.get("status")
-        if st is not None and int(st) >= 400:
-            body = safe_trim(str(tx.get("response_body") or ""), 500)
-            raise RuntimeError(f"createProject 失败：HTTP {st} {body}")
-
-        pid = _parse_trpc_create_project_response(tx.get("_json"))
-        if not pid:
-            raise RuntimeError(f"createProject 响应无效：{safe_trim(str(tx.get('response_body') or ''), 400)}")
-
-        append_log(log_file, f"[veo][project] created title={title!r} project_id={pid}")
-        project_url = f"https://labs.google/fx/tools/flow/project/{pid}"
-        try:
-            await sess.pw_ctx.page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
-            append_log(log_file, f"[veo][project] navigated to created project url={project_url!r}")
-        except Exception as e:
-            # 项目已创建成功，导航失败不影响入库；仅记录日志，避免重复创建项目。
-            append_log(log_file, f"[veo][project] goto created project failed url={project_url!r}: {e}")
-        return pid
+    info = await submit_extension_task(
+        space_id=sid,
+        window_key=wkey,
+        provider="veo",
+        payload={
+            "action": "create_flow_project",
+            "workflow_kind": "create_flow_project",
+            "target_url": _veo_extension_labs_url(target_url),
+            "project_page": _veo_extension_labs_url(target_url),
+            "title": title,
+            "tool_name": tn,
+        },
+        progress_cb=_noop_progress_cb,
+        timeout_seconds=60.0,
+    )
+    if not isinstance(info, dict):
+        raise RuntimeError(f"插件返回 createProject 格式异常：{info!r}")
+    pid = str(info.get("project_id") or info.get("projectId") or "").strip()
+    if not pid:
+        pid = _parse_trpc_create_project_response(info.get("response"))
+    if not pid:
+        raise RuntimeError(f"createProject 响应无效：{safe_trim(str(info), 500)}")
+    append_log(log_file, f"[veo][project] created via extension title={title!r} project_id={pid}")
+    return pid
 
 
 async def veo_delete_flow_project_in_window(
@@ -4322,50 +4927,53 @@ async def veo_delete_flow_project_in_window(
     target_url: str,
     project_id: str,
 ) -> Dict[str, Any]:
-    """在指纹浏览器页面内调用 Flow `project.deleteProject`，删除指定 Flow 项目。"""
+    """通过浏览器插件在指纹窗口内调用 Flow `project.deleteProject`。"""
     pid = str(project_id or "").strip()
     if not pid:
         raise RuntimeError("project_id 不能为空")
     sess._cancel_idle_close()
-    async with sess._bring_drafts_lock:
-        await sess.ensure_open(
-            args=sess.browser_open_args,
-            force_open=sess.browser_force_open,
-            headless=sess.browser_headless,
-            acquire_bring_lock=False,
+    sid, wkey = _veo_extension_ids_from_session(sess)
+    log_file = Path(sess.monitor_log_path) if sess.monitor_log_path else MONITOR_LOG_FILE
+    client = await ensure_extension_connected_via_window(
+        sess=sess,
+        target_url=target_url,
+        space_id=sid,
+        window_key=wkey,
+        wait_seconds=8.0,
+        log_file=log_file,
+        auto_triger_connection=True,
+    )
+    if client is None:
+        raise NonPenalizedTaskError(
+            f"浏览器插件未连接：space_id={sid!r} window_key={wkey!r}",
+            status_code=503,
         )
-        await sess._bring_target_page_to_front(refresh_target=False, drafts_url=target_url, acquire_bring_lock=False)
-        if sess.pw_ctx.page is None:
-            raise RuntimeError("page 未初始化")
-
-        log_file = Path(sess.monitor_log_path) if sess.monitor_log_path else (MONITOR_LOG_FILE)
-        url = _veo_trpc_delete_project_url(target_url)
-        json_data = {"json": {"projectToDeleteId": pid}}
-
-        tx = await page_fetch_json(
-            sess.pw_ctx.page,
-            url=url,
-            method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json_data=json_data,
-            log_file=log_file,
-        )
-        st = tx.get("status")
-        if st is not None and int(st) >= 400:
-            body = safe_trim(str(tx.get("response_body") or ""), 500)
-            raise RuntimeError(f"deleteProject 失败：HTTP {st} {body}")
-
-        append_log(log_file, f"[veo][project] deleted project_id={pid}")
-        resp = tx.get("_json")
-        return {
-            "success": True,
+    info = await submit_extension_task(
+        space_id=sid,
+        window_key=wkey,
+        provider="veo",
+        payload={
+            "action": "delete_flow_project",
+            "workflow_kind": "delete_flow_project",
+            "target_url": _veo_extension_labs_url(target_url),
+            "project_page": _veo_extension_labs_url(target_url),
             "project_id": pid,
-            "response": resp,
-            "status": st,
-        }
+        },
+        progress_cb=_noop_progress_cb,
+        timeout_seconds=60.0,
+    )
+    if not isinstance(info, dict):
+        raise RuntimeError(f"插件返回 deleteProject 格式异常：{info!r}")
+    if info.get("success") is False:
+        raise RuntimeError(f"deleteProject 失败：{safe_trim(str(info), 500)}")
+    append_log(log_file, f"[veo][project] deleted via extension project_id={pid}")
+    return {
+        "success": True,
+        "project_id": pid,
+        "response": info.get("response"),
+        "status": info.get("status"),
+        "source": "extension",
+    }
 
 
 def _veo_resolve_n_frames(payload: Dict[str, Any]) -> int:
@@ -4582,10 +5190,12 @@ async def veo_workflow(
     image_mode = n_frames == 1
 
     ingredients_urls: List[str] = []
+    ingredients_video_urls: List[str] = []
     want_ingredients = False
     if not image_mode:
         ingredients_urls = _veo_collect_ingredients_image_urls(payload)
-        want_ingredients = len(ingredients_urls) >= 1
+        ingredients_video_urls = _veo_collect_ingredients_video_urls(payload)
+        want_ingredients = len(ingredients_urls) >= 1 or len(ingredients_video_urls) >= 1
         #raise NonPenalizedTaskError("Veo3.1视频维护中，暂时下架", status_code=400,content_violation=True)
 
     want_i2v = False
@@ -4665,6 +5275,7 @@ async def veo_workflow(
         f"[veo] workflow {_mode} n_frames={n_frames} start project_id={project_id!r} "
         f"prompt={safe_trim(prompt, 200)!r} "
         f"ingredients={len(ingredients_urls) if want_ingredients else 0} "
+        f"ingredient_videos={len(ingredients_video_urls) if want_ingredients else 0} "
         f"images={len(i2v_urls) if want_i2v else 0}",
     )
     await progress_cb(
@@ -4681,6 +5292,7 @@ async def veo_workflow(
             "prompt": safe_trim(prompt, 200),
             "project_id": project_id,
             "image_count": len(ingredients_urls) if want_ingredients else (len(i2v_urls) if want_i2v else 0),
+            "video_reference_count": len(ingredients_video_urls) if want_ingredients else 0,
         },
     )
 
@@ -4795,6 +5407,8 @@ async def veo_workflow(
                 want_i2v=want_i2v,
                 window_balance=_ext_window_balance,
             )
+            if want_ingredients and ingredients_video_urls:
+                _ext_model_key = "abra_edit"
             print(f"_ext_model_key:{_ext_model_key} _ext_video_aspect:{_ext_video_aspect}");
             _ext_image_aspect = None
             _ext_image_model = None
@@ -4832,7 +5446,70 @@ async def veo_workflow(
                     progress_cb=progress_cb,
                     log_file=log_file,
                 )
+            if ingredients_video_urls:
+                ingredients_video_urls = [
+                    await _veo_materialize_video_for_extension(
+                        ingredients_video_urls[0],
+                        kind="ingredients_video",
+                        progress_cb=progress_cb,
+                        log_file=log_file,
+                    )
+                ]
+        if ingredients_video_urls and not _veo_is_local_asset_url(str(ingredients_video_urls[0] or "")):
+            # 视频参考强制本地化：指纹浏览器通过插件分片上传本机白名单地址。
+            ingredients_video_urls = [
+                await _veo_materialize_video_for_extension(
+                    ingredients_video_urls[0],
+                    kind="ingredients_video",
+                    progress_cb=progress_cb,
+                    log_file=log_file,
+                )
+            ]
+        _ext_video_reference_meta: Dict[str, Any] = {}
+        if ingredients_video_urls:
+            _video_ref_url = str(ingredients_video_urls[0] or "").strip()
+            _video_ref_path = _veo_local_asset_path_from_url(_video_ref_url)
+            if _video_ref_path:
+                _ext_video_reference_meta = await _veo_probe_local_video_metadata(_video_ref_path)
+                if _ext_video_reference_meta:
+                    _veo_assert_reference_video_duration(_ext_video_reference_meta, source=_video_ref_url)
+                    try:
+                        await progress_cb(
+                            3,
+                            {
+                                "stage": "reference_video_metadata",
+                                "duration_seconds": _ext_video_reference_meta.get("duration_seconds"),
+                                "fps": _ext_video_reference_meta.get("fps"),
+                                "frame_count": _ext_video_reference_meta.get("frame_count"),
+                                "end_frame_index": _ext_video_reference_meta.get("end_frame_index"),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    append_log(
+                        log_file,
+                        "[veo][extension][video-cache] metadata "
+                        f"duration={_ext_video_reference_meta.get('duration_seconds')} "
+                        f"fps={_ext_video_reference_meta.get('fps')} "
+                        f"frames={_ext_video_reference_meta.get('frame_count')} "
+                        f"end_frame_index={_ext_video_reference_meta.get('end_frame_index')}",
+                    )
         ext_payload = dict(payload)
+        if _ext_video_reference_meta:
+            # Python 服务端已经下载到本机缓存，顺手 ffprobe 最快且能拿到真实 fps/帧数；
+            # 下发给插件，避免插件只能用 <video>.duration 后按固定 8fps 猜 endFrameIndex。
+            if _ext_video_reference_meta.get("duration_seconds"):
+                ext_payload.setdefault("ingredients_video_duration_seconds", _ext_video_reference_meta.get("duration_seconds"))
+                ext_payload.setdefault("video_reference_duration_seconds", _ext_video_reference_meta.get("duration_seconds"))
+            if _ext_video_reference_meta.get("fps"):
+                ext_payload.setdefault("ingredients_video_fps", _ext_video_reference_meta.get("fps"))
+                ext_payload.setdefault("video_reference_fps", _ext_video_reference_meta.get("fps"))
+            if _ext_video_reference_meta.get("frame_count"):
+                ext_payload.setdefault("ingredients_video_frame_count", _ext_video_reference_meta.get("frame_count"))
+                ext_payload.setdefault("video_reference_frame_count", _ext_video_reference_meta.get("frame_count"))
+            if _ext_video_reference_meta.get("end_frame_index") is not None:
+                ext_payload.setdefault("ingredients_video_end_frame_index", _ext_video_reference_meta.get("end_frame_index"))
+                ext_payload.setdefault("video_reference_end_frame_index", _ext_video_reference_meta.get("end_frame_index"))
         ext_payload.update(
             {
                 "workflow_kind": "image" if image_mode else "video",
@@ -4847,6 +5524,8 @@ async def veo_workflow(
                 "n_frames": n_frames,
                 "image_mode": image_mode,
                 "ingredients_urls": ingredients_urls,
+                "ingredients_video_urls": ingredients_video_urls,
+                "ingredients_video_url": ingredients_video_urls[0] if ingredients_video_urls else "",
                 "i2v_urls": i2v_urls,
                 "timeout_seconds": timeout_seconds,
                 "max_wait_seconds": max_wait_seconds,
@@ -4885,28 +5564,54 @@ async def veo_workflow(
                 )
             except Exception as e:
                 append_log(log_file, f"[veo][extension] ensure websocket for extension failed: {e}")
+        _ext_failure_reasons_from_progress: List[str] = []
+
+        async def _extension_progress_cb(_progress: int, _data: Optional[Dict[str, Any]] = None) -> None:
+            if isinstance(_data, dict):
+                _raw_failure_reasons = _data.get("failure_reasons") or _data.get("failureReasons")
+                if isinstance(_raw_failure_reasons, (list, tuple, set)):
+                    for _item in _raw_failure_reasons:
+                        _s = str(_item or "").strip()
+                        if _s and _s not in _ext_failure_reasons_from_progress:
+                            _ext_failure_reasons_from_progress.append(_s)
+                elif _raw_failure_reasons:
+                    _s = str(_raw_failure_reasons or "").strip()
+                    if _s and _s not in _ext_failure_reasons_from_progress:
+                        _ext_failure_reasons_from_progress.append(_s)
+            await progress_cb(_progress, _data)
+
         try:
             _ext_result = await submit_extension_task(
                 space_id=space_id,
                 window_key=window_key,
                 provider="veo",
                 payload=ext_payload,
-                progress_cb=progress_cb,
+                progress_cb=_extension_progress_cb,
                 timeout_seconds=max_wait_seconds + 120.0,
             )
         except Exception as e:
+            if _ext_failure_reasons_from_progress and not _veo_extract_failure_reasons(e):
+                try:
+                    setattr(e, "failure_reasons", list(_ext_failure_reasons_from_progress))
+                except Exception:
+                    pass
             _violation_reason = _veo_content_violation_reason(e)
             if _violation_reason:
-                _violation_prefix = _VEO_CONTENT_VIOLATION_REASON_MESSAGES.get(
-                    _violation_reason,
-                    f"VEO内容审核未通过（{_violation_reason}）",
-                )
                 try:
                     _violation_status = int(getattr(e, "status_code", None) or 0)
                 except Exception:
                     _violation_status = 0
                 if _violation_status < 400 or _violation_status >= 500:
                     _violation_status = 400
+                if _violation_reason == "MEDIA_GENERATION_STATUS_FAILED":
+                    # 该类错误的原始信息通常包含 status/code/message/failureReasons/
+                    # mediaGenerationId 等关键诊断字段，直接完整返回，便于用户调整提示词。
+                    raise NonPenalizedTaskError(
+                        str(e),
+                        status_code=_violation_status,
+                        content_violation=True,
+                    )
+                _violation_prefix = _veo_content_violation_message(_violation_reason, e)
                 raise NonPenalizedTaskError(
                     f"{_violation_prefix}：{safe_trim(str(e), 500)}",
                     status_code=_violation_status,

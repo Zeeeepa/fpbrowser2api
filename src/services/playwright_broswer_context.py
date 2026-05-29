@@ -887,7 +887,12 @@ _CTX_POOL: Dict[str, PlaywrightBrowserContext] = {}
 
 
 def _ctx_key(vendor: str, base_url: str, space_id: str, window_key: str) -> str:
-    return "|".join([(vendor or "").strip().lower(), (base_url or "").strip().lower(), (space_id or "").strip(), (window_key or "").strip()])
+    return "|".join([
+        str(vendor or "").strip().lower(),
+        str(base_url or "").strip().rstrip("/").lower(),
+        str(space_id or "").strip(),
+        str(window_key or "").strip(),
+    ])
 
 
 def drop_ctx(cache_key: str) -> None:
@@ -913,11 +918,11 @@ def get_or_create_ctx(
         if ctx is None:
             ctx = PlaywrightBrowserContext(
                 cache_key=k,
-                vendor=(vendor or "roxy").strip().lower(),
-                base_url=(base_url or "").strip().rstrip("/"),
+                vendor=str(vendor or "roxy").strip().lower(),
+                base_url=str(base_url or "").strip().rstrip("/"),
                 access_key=access_key,
-                space_id=(space_id or "").strip(),
-                window_key=(window_key or "").strip(),
+                space_id=str(space_id or "").strip(),
+                window_key=str(window_key or "").strip(),
                 fp_client=FPBrowserClient(),
             )
             _CTX_POOL[k] = ctx

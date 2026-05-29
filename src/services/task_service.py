@@ -130,26 +130,31 @@ def _remaining_quota_exclusive_floor_for_pick(
     task_type_code: str, payload: Optional[Dict[str, Any]]
 ) -> int:
     credit_threthold = 1;
+    plan_type = 0
     """与 pick 时 remaining_quota >= floor 及预扣额度对齐（见 _consume_quota_after_window_pick）。"""
     code = (task_type_code or "").strip()
     if code == "sora_gen_video":
-        return 3, credit_threthold
+        return 3, credit_threthold,plan_type
     if code == "veo_workflow":
-        if _veo_payload_video_model_override(payload or {}) is not None or _veo_payload_image_model_4k(payload or {}):
-            return 160,160
-        elif _veo_resolve_n_frames(payload or {}) > 1:
-            return 30,credit_threthold
+        credit_threthold = 0;
+        if _veo_payload_image_model_4k(payload or {}): #4k图片，0积分 至少pro账号
+            plan_type = 1
+            return 0,credit_threthold,plan_type
+        elif _veo_payload_video_model_override(payload or {}) is not None: #参考视频，40积分 任意账号
+            return 40,credit_threthold,plan_type
+        elif _veo_resolve_n_frames(payload or {}) > 1: #视频，30积分 任意账号
+            return 30,credit_threthold,plan_type
         else:
-            return 10,credit_threthold
+            return 0,credit_threthold,plan_type #普通图片，0积分 任意账号
     if code == "grok_workflow":
         if _veo_resolve_n_frames(payload or {}) > 1:
-            return 30,credit_threthold
+            return 30,credit_threthold,plan_type
         else:
-            return 10,credit_threthold
+            return 10,credit_threthold,plan_type
     if code == "dreamina_workflow":
         credit_threthold = _DREAMINA_MIN_CREDIT - _DREAMINA_GIFT_CREDIT;
-        return _DREAMINA_MIN_CREDIT,credit_threthold
-    return 3,credit_threthold
+        return _DREAMINA_MIN_CREDIT,credit_threthold, plan_type
+    return 3,credit_threthold, plan_type
 
 
 class TaskService:
@@ -405,19 +410,30 @@ class TaskService:
             if handler:
                 active_window_pool_handlers.add(handler)
             credit_threthold = 1;
+            plan_type = 0
             if handler in ("veo_workflow",):
                 hi = await self.db.task_type_has_mapping_remaining_quota_above(code, 30)
                 floor = 30 if hi else 10
             else:
-                floor,credit_threthold = _remaining_quota_exclusive_floor_for_pick(code, None)
+                floor,credit_threthold,plan_type = _remaining_quota_exclusive_floor_for_pick(code, None)
             try:
                 ids = await self.db.list_window_pool_target_mapping_ids(
-                    code, self._browser_pool_limit, floor,credit_threthold
+                    code, self._browser_pool_limit, floor, credit_threthold, plan_type
                 )
+                mids = sorted(int(x) for x in ids)
+                if mids:
+                    logger.info(
+                        "window_pool new_targets task_type=%s floor=%s credit_threshold=%s count=%d mids=%s",
+                        code,
+                        floor,
+                        credit_threthold,
+                        len(mids),
+                        mids,
+                    )
             except Exception as e:
                 logger.warning("window_pool targets %s: %s", code, e)
                 continue
-            new_targets[code] = {int(x) for x in ids}
+            new_targets[code] = set(mids)
 
         await self._sync_window_pool_auxiliary_tasks(active_window_pool_handlers)
 
@@ -438,9 +454,19 @@ class TaskService:
                 to_close.extend(old_set)
             else:
                 to_close.extend(old_set - new_targets[code])
+        if to_close:
+            logger.info(
+                "window_pool to_close mappings: count=%d mids=%s",
+                len(to_close),
+                sorted(to_close),
+            )
         for mid in to_close:
             if self._window_pool_stop.is_set():
                 return
+            logger.info(
+                "_window_pool_close_mapping: mapping=%s",
+                mid,
+            )
             await self._window_pool_close_mapping(mid)
             await asyncio.sleep(0)
 
@@ -449,6 +475,12 @@ class TaskService:
             old_set = prev.get(code, set())
             for mid in new_set - old_set:
                 to_open.append((code, mid))
+        if to_open:
+            logger.info(
+                "window_pool to_open mappings: count=%d mids=%s",
+                len(to_open),
+                [mid for _, mid in to_open],
+            )
         for code, mid in to_open:
             if self._window_pool_stop.is_set():
                 return
@@ -1240,7 +1272,7 @@ class TaskService:
         - 挑选排序由 DB 决定（consecutive_errors 最低优先，其次 remaining_quota 最少优先）
         - 若任务类型开启窗口池：仅从 `_window_pool_targets` 内由 DB 单事务 `pick_and_reserve_window_from_pool` 原子挑选（与全局 pick 相同：+60s error_cooldown_until，避免高并发下多任务盯上同一 mapping）；池为空或无可用则返回 None（不回退全局 pick）
         """
-        floor,credit_threthold = _remaining_quota_exclusive_floor_for_pick(task_type_code, payload)
+        floor,credit_threthold,plan_type = _remaining_quota_exclusive_floor_for_pick(task_type_code, payload)
         try:
             tt = await self.db.get_task_type_by_code(task_type_code)
         except Exception:
@@ -1254,7 +1286,8 @@ class TaskService:
                 task_type_code,
                 pool_ids,
                 remaining_quota_exclusive_floor=floor,
-                credit_threthold=credit_threthold
+                credit_threthold=credit_threthold,
+                plan_type=plan_type,
             )
             if not r:
                 return None
@@ -1264,7 +1297,8 @@ class TaskService:
             task_type_code=task_type_code,
             browser_pool_limit=self._browser_pool_limit,
             remaining_quota_exclusive_floor=floor,
-            credit_threthold=credit_threthold
+            credit_threthold=credit_threthold,
+            plan_type=plan_type,
         )
         if not r:
             return None
@@ -1553,7 +1587,7 @@ class TaskService:
                 if pi == _last_saved_progress:
                     return
                 # 只在关键节点或变化 >=5 时写库，大幅减少写频率
-                if pi not in (0, 100) and abs(pi - _last_saved_progress) < 5:
+                if pi not in (0,1,2,3,4,5,6,7,8,9,10, 100) and abs(pi - _last_saved_progress) < 5:
                     return
                 try:
                     await self.db.update_task(task_id, progress=pi)
@@ -1837,6 +1871,7 @@ class TaskService:
                 _err_lower = str(e).lower()
                 _is_violation = int(
                     "sora_content_violation" in _err_lower
+                    or "media_generation_status_failed" in _err_lower
                     or "cameo_not_found" in _err_lower
                     or "cameo_permission_denied" in _err_lower
                     or "包含违禁画面" in str(e)

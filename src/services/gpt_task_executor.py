@@ -124,6 +124,21 @@ def _bool(v: Any, default: bool = False) -> bool:
     return bool(v)
 
 
+def _gpt_is_token_invalidated_error(exc: BaseException) -> bool:
+    """ChatGPT access token 被服务端废止时应走普通失败/重试扣罚逻辑。
+
+    浏览器插件会把 HTTP 401 原文包装成 ``NonPenalizedTaskError`` 传回 Python，
+    但 ``token_invalidated`` 代表当前保存的 token 已不可用，不属于用户输入/内容类
+    可豁免错误；这里在 GPT workflow 边界把它重新归类为 ``RuntimeError``。
+    """
+    try:
+        text = str(exc or "")
+    except Exception:
+        text = ""
+    text = text.lower()
+    return "token_invalidated" in text or "authentication token has been invalidated" in text
+
+
 def _gpt_target_url(raw: Any = None) -> str:
     s = _one_str(raw) or DEFAULT_GPT_TARGET
     try:
@@ -812,6 +827,17 @@ def _gpt_cooldown_value_to_local_str(raw: Any) -> str:
     return _gpt_dt_to_local_str(dt)
 
 
+def veo_format_paygate_tier_label(tier: Optional[str]) -> str:
+    """将 userPaygateTier 转为可读套餐名（与 flow2api manage.html formatAccountType 一致）。"""
+    t = str(tier or "").strip()
+    if not t or t == "free":
+        # free账号
+        return "0" 
+    if t == "plus":
+        # pro账号
+        return "1"
+    return "-1" #其它类型
+
 def _gpt_image_quota_reset_at_from_payload(data: Any) -> int:
     """从 GPT balance payload/插件返回值中提取 image_gen 的 reset_after 秒级时间戳。"""
     d = data if isinstance(data, dict) else {}
@@ -994,6 +1020,9 @@ async def gpt_fetch_access_token_via_extension(
     token_timeout_seconds: float = 45.0,
     log_file: Optional[Path] = None,
     auto_triger_connection: Optional[bool] = True,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Dict[str, Any]:
     """通过浏览器插件读取 ChatGPT ``/api/auth/session`` access_token。"""
     sid, wkey = _gpt_extension_ids_from_session(sess, space_id=space_id, window_key=window_key)
@@ -1010,6 +1039,9 @@ async def gpt_fetch_access_token_via_extension(
         headless=getattr(sess, "browser_headless", None),
         pure_mode=getattr(sess, "browser_pure_mode", None),
         auto_triger_connection=auto_triger_connection,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
     )
     if client is None:
         raise NonPenalizedTaskError(f"浏览器插件未连接：space_id={sid!r} window_key={wkey!r}", status_code=503)
@@ -1044,6 +1076,9 @@ async def gpt_fetch_access_token_in_window(
     headless: bool = False,
     pure_mode: bool = True,
     timeout_seconds: float = 60.0,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Dict[str, Any]:
     """兼容旧入口：通过浏览器插件读取 ChatGPT 长 access_token。"""
     sess = get_or_create_veo_session(
@@ -1063,6 +1098,9 @@ async def gpt_fetch_access_token_in_window(
         connect_wait_seconds=10.0,
         token_timeout_seconds=timeout_seconds,
         log_file=sess._log_file,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
     )
 
 
@@ -1206,6 +1244,7 @@ async def gpt_fetch_membership_via_extension(
     if not membership:
         membership = _gpt_membership_from_raw(out.get("raw"), "")
     if membership:
+        membership = veo_format_paygate_tier_label(membership)
         out["membership"] = membership
         out["plan_title"] = _one_str(out.get("plan_title") or membership)
         out["plan_type"] = _one_str(out.get("plan_type") or membership)
@@ -1641,4 +1680,6 @@ async def gpt_workflow(
             timeout_seconds=timeout_seconds,
         )
     except Exception as e:
+        if _gpt_is_token_invalidated_error(e):
+            raise RuntimeError(str(e)) from e
         raise

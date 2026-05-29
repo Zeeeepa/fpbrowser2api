@@ -1514,7 +1514,9 @@ class Database:
                   w.deleted AS w_deleted, w.synced_at AS w_synced_at,
                   w.created_at AS w_created_at, w.updated_at AS w_updated_at,
                   (SELECT COUNT(*) FROM task_type_windows ttw
-                   WHERE ttw.window_pk = w.id AND ttw.deleted = 0) AS w_bound_task_type_count
+                   WHERE ttw.window_pk = w.id AND ttw.deleted = 0) AS w_bound_task_type_count,
+                  (SELECT GROUP_CONCAT(ttw.id, ',') FROM task_type_windows ttw
+                   WHERE ttw.window_pk = w.id AND ttw.deleted = 0) AS w_bound_task_type_mapping_ids
                 FROM projects p
                 LEFT JOIN browsers b ON b.project_id = p.id AND b.deleted = 0
                 LEFT JOIN spaces s ON s.browser_id = b.id AND s.deleted = 0
@@ -1592,6 +1594,7 @@ class Database:
                     "enabled": bool(r["w_enabled"]) if r["w_enabled"] is not None else True,
                     "window_status": r["w_window_status"] or 0,
                     "bound_task_type_count": r["w_bound_task_type_count"] or 0,
+                    "bound_task_type_mapping_ids": r["w_bound_task_type_mapping_ids"] or "",
                     "deleted": bool(r["w_deleted"]) if r["w_deleted"] is not None else False,
                     "synced_at": r["w_synced_at"],
                     "created_at": r["w_created_at"], "updated_at": r["w_updated_at"],
@@ -1745,7 +1748,9 @@ class Database:
                 """
                 SELECT w.*,
                        (SELECT COUNT(*) FROM task_type_windows t
-                        WHERE t.window_pk = w.id AND t.deleted = 0) AS bound_task_type_count
+                        WHERE t.window_pk = w.id AND t.deleted = 0) AS bound_task_type_count,
+                       (SELECT GROUP_CONCAT(t.id, ',') FROM task_type_windows t
+                        WHERE t.window_pk = w.id AND t.deleted = 0) AS bound_task_type_mapping_ids
                 FROM windows w
                 WHERE w.deleted = 0 AND w.space_pk = ?
                 ORDER BY (w.window_sort_num IS NULL) ASC, w.window_sort_num ASC, w.window_name ASC, w.id ASC
@@ -4348,6 +4353,20 @@ class Database:
                   w.window_key,
                   w.window_name,
                   w.platform_account,
+                  w.platform_account_id,
+                  w.platform_url,
+                  COALESCE(
+                    (SELECT a.platform_username FROM platform_accounts a WHERE a.deleted = 0 AND w.platform_account_id IS NOT NULL AND w.platform_account_id > 0 AND a.account_id = w.platform_account_id ORDER BY a.updated_at DESC, a.id DESC LIMIT 1),
+                    (SELECT a.platform_username FROM platform_accounts a WHERE a.deleted = 0 AND a.space_pk = w.space_pk AND TRIM(COALESCE(a.platform_username, '')) <> '' AND TRIM(COALESCE(a.platform_username, '')) = TRIM(COALESCE(w.platform_account, '')) ORDER BY a.updated_at DESC, a.id DESC LIMIT 1)
+                  ) AS platform_username,
+                  COALESCE(
+                    (SELECT a.platform_password FROM platform_accounts a WHERE a.deleted = 0 AND w.platform_account_id IS NOT NULL AND w.platform_account_id > 0 AND a.account_id = w.platform_account_id ORDER BY a.updated_at DESC, a.id DESC LIMIT 1),
+                    (SELECT a.platform_password FROM platform_accounts a WHERE a.deleted = 0 AND a.space_pk = w.space_pk AND TRIM(COALESCE(a.platform_username, '')) <> '' AND TRIM(COALESCE(a.platform_username, '')) = TRIM(COALESCE(w.platform_account, '')) ORDER BY a.updated_at DESC, a.id DESC LIMIT 1)
+                  ) AS platform_password,
+                  COALESCE(
+                    (SELECT a.platform_efa FROM platform_accounts a WHERE a.deleted = 0 AND w.platform_account_id IS NOT NULL AND w.platform_account_id > 0 AND a.account_id = w.platform_account_id ORDER BY a.updated_at DESC, a.id DESC LIMIT 1),
+                    (SELECT a.platform_efa FROM platform_accounts a WHERE a.deleted = 0 AND a.space_pk = w.space_pk AND TRIM(COALESCE(a.platform_username, '')) <> '' AND TRIM(COALESCE(a.platform_username, '')) = TRIM(COALESCE(w.platform_account, '')) ORDER BY a.updated_at DESC, a.id DESC LIMIT 1)
+                  ) AS platform_efa,
                   s.space_id AS space_id,
                   b.vendor,
                   b.lan_addr,
@@ -4895,6 +4914,7 @@ class Database:
         browser_pool_limit: int = 100,
         remaining_quota_exclusive_floor: int = 2,
         credit_threthold: int  = 1,
+        plan_type: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """挑选 1 个窗口并原子预占 1 个并发槽位（一步完成）。
 
@@ -4916,6 +4936,7 @@ class Database:
             return None
         pool_limit = max(1, int(browser_pool_limit or 100))
         quota_floor = max(0, int(remaining_quota_exclusive_floor))
+        required_plan_type = max(0, int(plan_type or 0))
 
         _lock = self._get_write_lock()
         for _attempt in range(5):
@@ -4945,6 +4966,7 @@ class Database:
                             m.error_cooldown_until AS error_cooldown_until,
                             COALESCE(m.inflight_slots, 0) AS inflight_slots,
                             COALESCE(w.window_status, 0) AS window_status,
+                            COALESCE(CAST(TRIM(COALESCE(m.sora_plan_title, '')) AS INTEGER), 0) AS membership_plan_type,
                             b.id AS browser_pk,
                             CASE WHEN COALESCE(b.browser_pool_limit, 0) > 0 THEN b.browser_pool_limit ELSE ? END AS effective_pool_limit
                           FROM task_types t
@@ -4956,6 +4978,7 @@ class Database:
                             AND t.code = ?
                             AND m.deleted = 0 AND m.enabled = 1
                             AND w.deleted = 0 AND w.enabled = 1
+                            AND (? <= 0 OR (TRIM(COALESCE(m.sora_plan_title, '')) GLOB '[0-9]*' AND TRIM(COALESCE(m.sora_plan_title, '')) NOT GLOB '*[^0-9]*' AND CAST(TRIM(COALESCE(m.sora_plan_title, '')) AS INTEGER) >= ?))
                         ),
                         pool_source AS (
                           SELECT
@@ -5006,7 +5029,7 @@ class Database:
                         ORDER BY consecutive_errors ASC, mapping_updated_at ASC,remaining_quota DESC
                         LIMIT 1
                         """,
-                        (pool_limit, code, quota_floor, credit_threthold, quota_floor, credit_threthold),
+                        (pool_limit, code, required_plan_type, required_plan_type, quota_floor, credit_threthold, quota_floor, credit_threthold),
                     )
                     #ORDER BY consecutive_errors ASC, mapping_updated_at ASC, remaining_quota DESC
                     picked = await cur.fetchone()
@@ -5033,8 +5056,9 @@ class Database:
                             OR (cooldown_until IS NOT NULL AND cooldown_until <= datetime('now','localtime', '+5 minutes'))
                           )
                           AND (error_cooldown_until IS NULL OR error_cooldown_until <= datetime('now','localtime'))
+                          AND (? <= 0 OR (TRIM(COALESCE(sora_plan_title, '')) GLOB '[0-9]*' AND TRIM(COALESCE(sora_plan_title, '')) NOT GLOB '*[^0-9]*' AND CAST(TRIM(COALESCE(sora_plan_title, '')) AS INTEGER) >= ?))
                         """,
-                        (mapping_id, threshold, task_concurrency, quota_floor),
+                        (mapping_id, threshold, task_concurrency, quota_floor, required_plan_type, required_plan_type),
                     )
                     if int(cur2.rowcount or 0) <= 0:
                         # 理论上在 IMMEDIATE 事务内不太会发生，但为了稳健性（以及未来条件调整）保留兜底
@@ -5101,6 +5125,7 @@ class Database:
         pool_mapping_ids: List[int],
         remaining_quota_exclusive_floor: int = 3,
         credit_threthold: int  = 1,
+        plan_type: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """在窗口池 mapping 集合内原子挑选并预占 1 槽位。
 
@@ -5114,6 +5139,7 @@ class Database:
         if not code or not ids:
             return None
         quota_floor = max(0, int(remaining_quota_exclusive_floor))
+        required_plan_type = max(0, int(plan_type or 0))
         placeholders = ",".join("?" for _ in ids)
 
         _lock = self._get_write_lock()
@@ -5142,6 +5168,7 @@ class Database:
                           AND m.deleted = 0 AND m.enabled = 1
                           AND w.deleted = 0 AND w.enabled = 1
                           AND w.window_status = 1
+                          AND (? <= 0 OR (TRIM(COALESCE(m.sora_plan_title, '')) GLOB '[0-9]*' AND TRIM(COALESCE(m.sora_plan_title, '')) NOT GLOB '*[^0-9]*' AND CAST(TRIM(COALESCE(m.sora_plan_title, '')) AS INTEGER) >= ?))
                           AND (m.error_cooldown_until IS NULL OR m.error_cooldown_until <= datetime('now','localtime'))
                           AND (m.consecutive_errors < t.continuous_error_threshold)
                           AND (COALESCE(m.inflight_slots, 0) < t.concurrency)
@@ -5152,7 +5179,7 @@ class Database:
                         ORDER BY m.consecutive_errors ASC, m.updated_at ASC, m.remaining_quota DESC
                         LIMIT 1
                         """,
-                        (code, *ids, quota_floor,credit_threthold),
+                        (code, *ids, required_plan_type, required_plan_type, quota_floor,credit_threthold),
                     )
                     picked = await cur.fetchone()
                     if not picked:
@@ -5179,8 +5206,9 @@ class Database:
                             OR (cooldown_until IS NOT NULL AND cooldown_until <= datetime('now','localtime', '+5 minutes'))
                           )
                           AND (error_cooldown_until IS NULL OR error_cooldown_until <= datetime('now','localtime'))
+                          AND (? <= 0 OR (TRIM(COALESCE(sora_plan_title, '')) GLOB '[0-9]*' AND TRIM(COALESCE(sora_plan_title, '')) NOT GLOB '*[^0-9]*' AND CAST(TRIM(COALESCE(sora_plan_title, '')) AS INTEGER) >= ?))
                         """,
-                        (f"+{window_call_cooldown_seconds} seconds", mapping_id, threshold, task_concurrency, quota_floor),
+                        (f"+{window_call_cooldown_seconds} seconds", mapping_id, threshold, task_concurrency, quota_floor, required_plan_type, required_plan_type),
                     )
                     if int(cur2.rowcount or 0) <= 0:
                         await db.execute("ROLLBACK")
@@ -5259,7 +5287,7 @@ class Database:
                 FROM task_types t
                 JOIN task_type_windows m ON m.task_type_id = t.id AND m.deleted = 0 AND m.enabled = 1
                 JOIN windows w ON m.window_pk = w.id AND w.deleted = 0 AND w.enabled = 1
-                WHERE t.code = ? AND t.deleted = 0 AND t.enabled = 1
+                WHERE t.code = ? AND t.deleted = 0 AND t.enabled = 1 AND COALESCE(w.window_status, 1) = 0
                   AND (
                     m.remaining_quota > ?
                     OR (
@@ -5328,7 +5356,6 @@ class Database:
                   AND t.create_task_handler = 'veo_workflow'
                   AND m.deleted = 0 AND m.enabled = 1
                   AND w.deleted = 0 AND w.enabled = 1
-                  AND COALESCE(w.window_status, 0) = 1
                   AND b.deleted = 0
                   AND TRIM(COALESCE(m.sora_access_token, '')) <> ''
                   AND TRIM(COALESCE(m.sora_access_expires, '')) <> ''
@@ -5336,6 +5363,7 @@ class Database:
                 ORDER BY m.sora_access_expires ASC, m.updated_at ASC
                 """
             )
+            #AND COALESCE(w.window_status, 0) = 1
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
@@ -5345,6 +5373,7 @@ class Database:
         browser_pool_limit: int = 100,
         remaining_quota_exclusive_floor: int = 3,
         credit_threthold: int = 1,
+        plan_type: int = 0,
     ) -> List[int]:
         """与 pick_and_reserve_window_for_task 相同的候选与每浏览器上限，返回应保持在池中的 mapping_id 列表（不修改 inflight）。
 
@@ -5355,6 +5384,7 @@ class Database:
             return []
         pool_limit = max(1, int(browser_pool_limit or 100))
         quota_floor = max(0, int(remaining_quota_exclusive_floor))
+        required_plan_type = max(0, int(plan_type or 0))
         async with self._read_conn() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -5382,6 +5412,7 @@ class Database:
                     AND t.code = ?
                     AND m.deleted = 0 AND m.enabled = 1
                     AND w.deleted = 0 AND w.enabled = 1
+                    AND (? <= 0 OR (TRIM(COALESCE(m.sora_plan_title, '')) GLOB '[0-9]*' AND TRIM(COALESCE(m.sora_plan_title, '')) NOT GLOB '*[^0-9]*' AND CAST(TRIM(COALESCE(m.sora_plan_title, '')) AS INTEGER) >= ?))
                 ),
                 pool_source AS (
                   SELECT
@@ -5430,7 +5461,7 @@ class Database:
                   AND is_runnable = 1
                 ORDER BY consecutive_errors ASC, mapping_updated_at ASC, remaining_quota DESC
                 """,
-                (pool_limit, code, quota_floor, credit_threthold, quota_floor,credit_threthold),
+                (pool_limit, code, required_plan_type, required_plan_type, quota_floor, credit_threthold, quota_floor, credit_threthold),
             )
             rows = await cur.fetchall()
             return [int(r["mapping_id"]) for r in rows]

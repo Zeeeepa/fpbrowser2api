@@ -98,6 +98,9 @@ def build_extension_launcher_url(
     space_id: str,
     window_key: str,
     launcher_url: Optional[str] = None,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> str:
     """构建插件配置中转页 URL。
 
@@ -123,6 +126,12 @@ def build_extension_launcher_url(
                 "redirect_url": str(redirect_url or "").strip(),
             }
         )
+        if google_account:
+            fragment_items["fpb_google_account"] = str(google_account).strip()
+        if google_password:
+            fragment_items["fpb_google_password"] = str(google_password)
+        if google_efa:
+            fragment_items["fpb_google_efa"] = str(google_efa).strip()
         token = config.extension_bridge_token
         if token:
             fragment_items["fpb_bridge_token"] = token
@@ -137,6 +146,9 @@ def build_extension_launcher_url(
             f"fpb_space_id={space_id}&fpb_window_key={window_key}"
             f"&fpb_bridge_url={get_default_extension_bridge_url()}"
             f"&redirect_url={redirect_url}"
+            f"{('&fpb_google_account=' + str(google_account).strip()) if google_account else ''}"
+            f"{('&fpb_google_password=' + str(google_password)) if google_password else ''}"
+            f"{('&fpb_google_efa=' + str(google_efa).strip()) if google_efa else ''}"
         )
 
 
@@ -253,6 +265,9 @@ async def trigger_veo_extension_ws_connection_via_window(
     pure_mode: Optional[bool] = None,
     log_file: Optional[Path] = None,
     launcher_url: Optional[str] = None,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Any:
     """打开插件配置中转页，触发插件连接 WebSocket，再由插件跳转目标页。
 
@@ -274,7 +289,11 @@ async def trigger_veo_extension_ws_connection_via_window(
         space_id=sid,
         window_key=wkey,
         launcher_url=launcher_url,
+        google_account=google_account,
+        google_password=google_password,
+        google_efa=google_efa,
     )
+    print(f"annotated_launcher:{annotated_launcher}");
     lock = getattr(sess, "_bring_drafts_lock", None)
     if lock is not None:
         async with lock:
@@ -328,6 +347,9 @@ async def ensure_veo_extension_connected_via_window(
     pure_mode: Optional[bool] = None,
     launcher_url: Optional[str] = None,
     auto_triger_connection: Optional[bool] = True,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
 ) -> Any:
     """先检查插件 WS；未连接时打开中转页触发连接。"""
     sid, wkey = _extension_ids_from_session(sess, space_id=space_id, window_key=window_key)
@@ -346,6 +368,9 @@ async def ensure_veo_extension_connected_via_window(
             pure_mode=pure_mode,
             log_file=log_file,
             launcher_url=launcher_url,
+            google_account=google_account,
+            google_password=google_password,
+            google_efa=google_efa,
         )
     return None
 

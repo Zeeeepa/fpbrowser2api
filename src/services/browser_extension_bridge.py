@@ -85,7 +85,15 @@ def get_default_extension_bridge_url() -> str:
     return f"ws://127.0.0.1:{int(config.server_port)}/api/extension/ws"
 
 
-def annotate_url_with_extension_config(url: str, *, space_id: str, window_key: str) -> str:
+def annotate_url_with_extension_config(
+    url: str,
+    *,
+    space_id: str,
+    window_key: str,
+    google_account: Optional[str] = None,
+    google_password: Optional[str] = None,
+    google_efa: Optional[str] = None,
+) -> str:
     """把插件自动注册所需配置写入 URL hash，目标站服务端不可见。
 
     content script 会读取这些 fpb_* 字段并写入 chrome.storage.local，然后 background
@@ -109,6 +117,12 @@ def annotate_url_with_extension_config(url: str, *, space_id: str, window_key: s
             hash_items["fpb_bridge_token"] = token
         else:
             hash_items.pop("fpb_bridge_token", None)
+        if google_account:
+            hash_items["fpb_google_account"] = str(google_account).strip()
+        if google_password:
+            hash_items["fpb_google_password"] = str(google_password)
+        if google_efa:
+            hash_items["fpb_google_efa"] = str(google_efa).strip()
         return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, urlencode(hash_items)))
     except Exception:
         sep = "&" if "#" in u else "#"
@@ -116,6 +130,9 @@ def annotate_url_with_extension_config(url: str, *, space_id: str, window_key: s
             f"{u}{sep}"
             f"fpb_space_id={space_id}&fpb_window_key={window_key}"
             f"&fpb_bridge_url={get_default_extension_bridge_url()}"
+            f"{('&fpb_google_account=' + str(google_account).strip()) if google_account else ''}"
+            f"{('&fpb_google_password=' + str(google_password)) if google_password else ''}"
+            f"{('&fpb_google_efa=' + str(google_efa).strip()) if google_efa else ''}"
         )
 
 
@@ -233,7 +250,12 @@ async def _handle_client_message(client: ExtensionClient, msg: Dict[str, Any]) -
         if "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in message or str((err or {}).get("reason") or "") == "PUBLIC_ERROR_UNUSUAL_ACTIVITY":
             fut.set_exception(RuntimeError(message))
         else:
-            fut.set_exception(NonPenalizedTaskError(message, status_code=status_code))
+            exc = NonPenalizedTaskError(message, status_code=status_code)
+            try:
+                setattr(exc, "failure_reasons", (err or {}).get("failure_reasons") or (err or {}).get("failureReasons"))
+            except Exception:
+                pass
+            fut.set_exception(exc)
 
 
 async def _ping_client_loop(client: ExtensionClient) -> None:

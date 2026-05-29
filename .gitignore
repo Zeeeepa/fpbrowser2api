@@ -20,6 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+static/assets/veo_image_cache/
 
 # IDE 相关
 .vscode/

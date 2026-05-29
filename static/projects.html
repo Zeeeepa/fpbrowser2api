@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
@@ -562,6 +562,7 @@
       const LS_BROWSER_EXPANDED_MAP = "fpbrowser2api.browser_expanded_map";
       const LS_LAST_MOVE_WINDOW_TARGET_SPACE = "fpbrowser2api.last_move_window_target_space_pk";
       const LS_WINDOW_ID_SORT_MAP = "fpbrowser2api.window_id_sort_map";
+      const LS_WINDOW_MAPPING_SORT_MAP = "fpbrowser2api.window_mapping_sort_map";
       const LS_DELETE_WINDOW_WITH_ACCOUNT = "fpbrowser2api.delete_window_with_account";
 
       function currentProjectId() {
@@ -635,6 +636,39 @@
         writeWindowIdSortMap(map);
       }
 
+      function readWindowMappingSortMap() {
+        try {
+          const raw = localStorage.getItem(LS_WINDOW_MAPPING_SORT_MAP);
+          if (!raw) return {};
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === "object" ? parsed : {};
+        } catch {
+          return {};
+        }
+      }
+
+      function writeWindowMappingSortMap(map) {
+        localStorage.setItem(LS_WINDOW_MAPPING_SORT_MAP, JSON.stringify(map && typeof map === "object" ? map : {}));
+      }
+
+      function getWindowMappingSortDir(spacePk) {
+        const key = String(spacePk || "").trim();
+        if (!key) return "";
+        const map = readWindowMappingSortMap();
+        const dir = String(map[key] || "").trim().toLowerCase();
+        return dir === "asc" || dir === "desc" ? dir : "";
+      }
+
+      function setWindowMappingSortDir(spacePk, dir) {
+        const key = String(spacePk || "").trim();
+        if (!key) return;
+        const map = readWindowMappingSortMap();
+        const normalized = String(dir || "").trim().toLowerCase();
+        if (normalized === "asc" || normalized === "desc") map[key] = normalized;
+        else delete map[key];
+        writeWindowMappingSortMap(map);
+      }
+
       function getCachedDeleteWindowWithAccount() {
         try {
           return localStorage.getItem(LS_DELETE_WINDOW_WITH_ACCOUNT) === "1";
@@ -656,15 +690,30 @@
         return Number.isFinite(n) ? n : 0;
       }
 
+      function getWindowMappingSortValue(w) {
+        const raw = String(w?.bound_task_type_mapping_ids || "").trim();
+        if (!raw) return Number.POSITIVE_INFINITY;
+        const first = raw.split(",").map(x => parseInt(String(x || "").trim(), 10)).find(n => Number.isFinite(n) && n > 0);
+        return Number.isFinite(first) ? first : Number.POSITIVE_INFINITY;
+      }
+
       function sortWindowsForSpace(windows, spacePk) {
         const xs = Array.isArray(windows) ? windows.slice() : [];
-        const dir = getWindowIdSortDir(spacePk);
+        const mappingDir = getWindowMappingSortDir(spacePk);
+        const idDir = getWindowIdSortDir(spacePk);
+        const dir = mappingDir || idDir;
         if (!dir) return xs;
         const factor = dir === "desc" ? -1 : 1;
         xs.sort((a, b) => {
-          const av = getWindowSortNumValue(a);
-          const bv = getWindowSortNumValue(b);
-          if (av !== bv) return (av - bv) * factor;
+          if (mappingDir) {
+            const av = getWindowMappingSortValue(a);
+            const bv = getWindowMappingSortValue(b);
+            if (av !== bv) return (av - bv) * factor;
+          } else {
+            const av = getWindowSortNumValue(a);
+            const bv = getWindowSortNumValue(b);
+            if (av !== bv) return (av - bv) * factor;
+          }
           const aid = Number(a?.id ?? 0) || 0;
           const bid = Number(b?.id ?? 0) || 0;
           return (aid - bid) * factor;
@@ -688,6 +737,30 @@
             aria-label="按窗口排序号排序"
           >窗口ID${arrow}</button>
         `;
+      }
+
+
+      function renderWindowMappingHeader(spacePk) {
+        const dir = getWindowMappingSortDir(spacePk);
+        const arrow = dir === "asc" ? " ↑" : dir === "desc" ? " ↓" : "";
+        const title = dir === "desc"
+          ? "当前降序，点击切换为升序（按 mapping id）"
+          : "点击按 mapping id 排序（升序/降序切换）";
+        return `
+          <button
+            class="btn btn-link btn-sm p-0 text-decoration-none align-baseline"
+            type="button"
+            data-action="toggle_window_mapping_sort"
+            data-space_pk="${escapeHtml(String(spacePk ?? ""))}"
+            title="${escapeHtml(title)}"
+            aria-label="按 mapping id 排序"
+          >Mapping ID${arrow}</button>
+        `;
+      }
+
+      function renderWindowMappingCell(w) {
+        const mappingIds = String(w?.bound_task_type_mapping_ids || "").trim();
+        return `<td class="mono text-muted" data-role="mappingIdCell">${mappingIds ? escapeHtml(mappingIds) : "-"}</td>`;
       }
 
       function findSpaceByPk(spacePk) {
@@ -961,7 +1034,7 @@
                   <th>窗口名称</th>
                   <th>操作</th>
                   <th>账号</th>
-                  <th>网址</th>
+                  <th>${renderWindowMappingHeader(spacePk)}</th>
                   <th>代理</th>
                   <th>启用</th>
                   <th>窗口状态</th>
@@ -1021,7 +1094,7 @@
                           data-window_key="${escapeHtml(String(w.window_key ?? ""))}">同步</button>
                       </div>
                     </td>
-                    <td class="mono" data-role="platformUrlCell">${renderLink(w.platform_url)}</td>
+                    ${renderWindowMappingCell(w)}
                     <td style="min-width: 260px;">
                       <select class="form-select form-select-sm mono" data-role="proxySelect"
                         data-space_pk="${escapeHtml(String(spacePk ?? ""))}"
@@ -1077,6 +1150,15 @@
           const current = getWindowIdSortDir(spacePk);
           const next = current === "asc" ? "desc" : "asc";
           setWindowIdSortDir(spacePk, next);
+          setWindowMappingSortDir(spacePk, "");
+          rerenderSpaceWindowsByState(spacePk);
+        } else if (action === "toggle_window_mapping_sort") {
+          const spacePk = parseInt(ds.space_pk, 10);
+          if (!spacePk) return;
+          const current = getWindowMappingSortDir(spacePk);
+          const next = current === "asc" ? "desc" : "asc";
+          setWindowMappingSortDir(spacePk, next);
+          setWindowIdSortDir(spacePk, "");
           rerenderSpaceWindowsByState(spacePk);
         } else if (action === "delete_browser") {
           deleteBrowser(parseInt(ds.browser_id, 10));
@@ -1273,7 +1355,6 @@
           if (row) {
             const accountSel = row.querySelector(`select[data-role="accountSelect"]`);
             const infoEl = row.querySelector(`[data-role="accountBindInfo"]`);
-            const urlCell = row.querySelector(`[data-role="platformUrlCell"]`);
             const deleteBtn = row.querySelector(`[data-action="delete_window"]`);
             const selectBox = row.querySelector(`input[data-role="windowSelect"]`);
             const proxySel = row.querySelector(`select[data-role="proxySelect"]`);
@@ -1285,7 +1366,6 @@
               accountSel.dataset.current_url = url;
             }
             if (infoEl) infoEl.textContent = `当前账号：${username || "-"}`;
-            if (urlCell) urlCell.innerHTML = renderLink(url);
             if (deleteBtn) {
               deleteBtn.dataset.account_id = String(accountId || 0);
               deleteBtn.dataset.account_username = username;
@@ -2165,7 +2245,7 @@
                   <th>窗口名称</th>
                   <th>操作</th>
                   <th>账号</th>
-                  <th>网址</th>
+                  <th>${renderWindowMappingHeader(spacePk)}</th>
                   <th>代理</th>
                   <th>启用</th>
                   <th>窗口状态</th>
@@ -2232,7 +2312,7 @@
                   data-window_key="${escapeHtml(String(w.window_key ?? ""))}">同步</button>
               </div>
             </td>
-            <td class="mono" data-role="platformUrlCell">${renderLink(w.platform_url)}</td>
+            ${renderWindowMappingCell(w)}
             <td style="min-width: 260px;">
               <select class="form-select form-select-sm mono" data-role="proxySelect"
                 data-space_pk="${escapeHtml(String(spacePk ?? w.space_pk ?? ""))}"
@@ -4580,7 +4660,6 @@
           const td = el.closest("td");
           const row = el.closest("tr");
           const infoEl = td ? td.querySelector(`[data-role="accountBindInfo"]`) : null;
-          const urlCell = row ? row.querySelector(`[data-role="platformUrlCell"]`) : null;
           const deleteBtn = row ? row.querySelector(`[data-action="delete_window"]`) : null;
           const selectBox = row ? row.querySelector(`input[data-role="windowSelect"]`) : null;
           const arr = normalizeAccounts(accountsCache.get(spacePk) || []);
@@ -4589,7 +4668,6 @@
             el.dataset.current_account = String(picked.platform_username || "").trim();
             el.dataset.current_url = String(picked.platform_url || "").trim();
             if (infoEl) infoEl.textContent = `当前账号：${picked.platform_username || "-"}`;
-            if (urlCell) urlCell.innerHTML = renderLink(String(picked.platform_url || "").trim());
             if (deleteBtn) {
               deleteBtn.dataset.account_id = String(picked.account_id || 0);
               deleteBtn.dataset.account_username = String(picked.platform_username || "").trim();
@@ -4606,7 +4684,6 @@
             el.dataset.current_account = "";
             el.dataset.current_url = "";
             if (infoEl) infoEl.textContent = "当前账号：-";
-            if (urlCell) urlCell.textContent = "-";
             if (deleteBtn) {
               deleteBtn.dataset.account_id = "0";
               deleteBtn.dataset.account_username = "";

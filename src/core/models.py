@@ -113,6 +113,8 @@ class WindowInfo(BaseModel):
     window_status: int = 0
     # task_type_windows 中绑定该窗口的记录数（未删除）
     bound_task_type_count: int = 0
+    # task_type_windows 映射 ID 列表（逗号分隔，用于管理页展示 mapping id）
+    bound_task_type_mapping_ids: Optional[str] = None
     deleted: bool = False
 
     raw: Optional[Dict[str, Any]] = None  # 保存原始窗口信息 JSON（便于排查/扩展）
