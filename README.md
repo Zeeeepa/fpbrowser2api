@@ -4,9 +4,8 @@
 > 利用指纹浏览器管理账号保活 + 插件调用页面功能，实现多账号管理自动化 AI 视频 & AI 图片生成。当前框架已围绕 Sora、veo3.1 / VEO/Google Flow、Grok、banana2/pro、Seedance2.0 国际站等方向设计；理论上可扩展到任意网站的自动化与接口研究。
 > 注意：本项目非逆向！！只是利用浏览器的功能实现自动化，请勿应用于商业。
 
-### 操作视频
-##### 第1集：https://www.bilibili.com/video/BV1vL5r65EzE/?vd_source=7fa3ff8dba916183629a05529aa18af2
-##### 第2集: 插件使用教程 https://www.bilibili.com/video/BV1WZVe6BEgs/
+### 2026-6-7更新
+##### 最新完整教程 https://www.bilibili.com/video/BV1AjEH62EBV/
 
 ## 最新情人节奉献功能2026-5-20：
 ##### 1.Flow: Nana Banana2 1k/2k/4k(图片生成)、Banana Pro 1k/2k/4k(图片生成)、veo-3-1(视频生成)、Veo-omni-flash(视频生成)
