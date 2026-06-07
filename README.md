@@ -24,9 +24,7 @@
 ## 为什么需要指纹浏览器
 本框架不是传统的裸 HTTP 调用脚本，而是通过指纹浏览器维持一个更接近真人使用的浏览器环境：
 1. 每个任务绑定一个独立的浏览器窗口、Cookie、LocalStorage、UA、代理和浏览器指纹。
-2. 用户可以先在指纹浏览器中手动登录目标站点、完成必要验证或订阅准备。
-3. 后端再通过指纹浏览器暴露的 CDP 地址连接到该窗口，在页面上下文中执行 `fetch`、上传文件、轮询状态、读取结果。
-4. 当遇到 Cloudflare/Turnstile 等挑战页时，执行器会检测页面、等待自动放行、尝试点击验证控件，必要时关闭并重开指纹窗口进行自愈。
+2. 插件稳定性>协议>playwright，适合需要稳定的场景
 
 推荐使用 RoxyBrowser：请到 <https://roxybrowser.com?code=0416Z62A> 下载客户端，注册并登录后创建空间、项目和浏览器窗口。
 <img width="1919" height="914" alt="ScreenShot_2026-04-30_185638_945" src="https://github.com/user-attachments/assets/34238cc6-66c0-41eb-97b0-405014ea467c" />
