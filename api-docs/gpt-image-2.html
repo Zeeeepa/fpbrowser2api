@@ -1,15 +1,115 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GPT Image 2 · 图片异步 API 接入文档</title><link rel="stylesheet" href="doc.css"></head><body><header><a href="../index.html">返回接口目录</a><h1>GPT Image 2 · 图片异步 API 接入文档</h1><p>入口路径使用 <code>/v1/videos</code>，最终结果为图片。</p></header><main><article><h2>文生图</h2><pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GPT Image 2 · 图片异步 API 接入文档</title>
+  <link rel="stylesheet" href="doc.css">
+</head>
+<body>
+  <header>
+    <a href="../index.html">返回接口目录</a>
+    <h1>GPT Image 2 · 图片异步 API 接入文档</h1>
+    <p>入口路径使用 <code>/v1/videos</code>，最终结果为图片。</p>
+  </header>
+  <main>
+    <article>
+      <h2>文生图</h2>
+<pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
   -H "Authorization: Bearer api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-image-2-2K",
     "prompt": "retro neon poster, cyberpunk girl",
     "aspect_ratio": "9:16"
-  }'</code></pre><h2>多图生图</h2><pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
+  }'</code></pre>
+
+      <h2>多图生图</h2>
+<pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
   -H "Authorization: Bearer api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-image-2-2K",
     "prompt": "the character from the reference photo, in a futuristic city",
     "image_urls": ["https://your-cdn.com/ref.jpg"]
-  }'</code></pre><p>完成后读取 <code>image_url</code>、<code>url</code> 或 <code>metadata.result_urls</code>。</p></article></main></body></html>
+  }'</code></pre>
+
+      <h2>请求字段</h2>
+      <table>
+        <tr><th>字段</th><th>说明</th></tr>
+        <tr><td><code>model</code></td><td><code>gpt-image-2-2K</code></td></tr>
+        <tr><td><code>prompt</code></td><td>生成提示词</td></tr>
+        <tr><td><code>image_urls</code></td><td>多参考图 URL 数组</td></tr>
+        <tr><td><code>aspect_ratio</code></td><td>支持 <code>16:9</code> / <code>9:16</code> / <code>3:4</code> / <code>4:3</code> / <code>1:1</code></td></tr>
+      </table>
+      <h2>查询任务</h2>
+<pre><code>curl https://xxx.xxx.xxx/v1/videos/8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234 \
+  -H "Authorization: Bearer api-key"</code></pre>
+
+      <h2>查询返回示例</h2>
+      <p>处理中：</p>
+<pre><code>{
+  "id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "task_id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "object": "video",
+  "created_at": 1714200000000,
+  "status": "in_progress",
+  "state": "in_progress",
+  "task_status": "in_progress",
+  "progress": 45,
+  "model": "gpt-image-2-2K",
+  "video_url": null,
+  "metadata": {
+    "result_urls": []
+  },
+  "success": false,
+  "final": false
+}</code></pre>
+      <p>完成：</p>
+<pre><code>{
+  "id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "task_id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "object": "video",
+  "created_at": 1714200000000,
+  "status": "completed",
+  "state": "completed",
+  "task_status": "completed",
+  "progress": 100,
+  "model": "gpt-image-2-2K",
+  "video_url": null,
+  "image_url": "https://xxx.xxx.xxx/generated/image.jpg",
+  "url": "https://xxx.xxx.xxx/generated/image.jpg",
+  "metadata": {
+    "result_urls": ["https://xxx.xxx.xxx/generated/image.jpg"]
+  },
+  "success": true,
+  "final": true,
+  "completed_at": 1714200180000
+}</code></pre>
+
+      <h2>返回字段</h2>
+      <table>
+        <tr><th>字段</th><th>说明</th></tr>
+        <tr><td><code>id</code> / <code>task_id</code></td><td>任务 ID，用于继续查询</td></tr>
+        <tr><td><code>status</code> / <code>state</code> / <code>task_status</code></td><td>任务状态，三者值一致，便于兼容不同中转站</td></tr>
+        <tr><td><code>progress</code></td><td>进度，0-100</td></tr>
+        <tr><td><code>image_url</code></td><td>图片任务完成后的主结果地址</td></tr>
+        <tr><td><code>url</code></td><td>完成后的通用结果地址，图片任务等同于 <code>image_url</code></td></tr>
+        <tr><td><code>metadata.result_urls</code></td><td>结果地址数组，通常取第一项即可</td></tr>
+        <tr><td><code>success</code></td><td><code>status</code> 为 <code>completed</code> 时为 <code>true</code></td></tr>
+        <tr><td><code>final</code></td><td><code>completed</code> 或 <code>failed</code> 时为 <code>true</code></td></tr>
+        <tr><td><code>error.message</code></td><td>失败原因，仅失败时返回</td></tr>
+      </table>
+
+      <h2>状态说明</h2>
+      <table>
+        <tr><th>status</th><th>含义</th><th>处理方式</th></tr>
+        <tr><td><code>queued</code></td><td>排队中</td><td>继续轮询</td></tr>
+        <tr><td><code>in_progress</code></td><td>生成中</td><td>继续轮询</td></tr>
+        <tr><td><code>completed</code></td><td>已完成</td><td>读取 <code>image_url</code>、<code>url</code> 或 <code>metadata.result_urls</code></td></tr>
+        <tr><td><code>failed</code></td><td>失败</td><td>查看 <code>error.message</code></td></tr>
+      </table>
+    </article>
+  </main>
+</body>
+</html>

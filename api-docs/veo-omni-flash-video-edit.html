@@ -1,4 +1,27 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VEO Omni Flash Video Edit · 视频编辑接口</title><link rel="stylesheet" href="doc.css"></head><body><header><a href="../index.html">返回接口目录</a><h1>VEO Omni Flash Video Edit · 视频编辑接口</h1><p>基于 1 个参考视频地址进行编辑，可附加参考图片。</p></header><main><article><h2>提交任务</h2><pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VEO Omni Flash Video Edit · 视频编辑接口</title>
+  <link rel="stylesheet" href="doc.css">
+</head>
+<body>
+  <header>
+    <a href="../index.html">返回接口目录</a>
+    <h1>VEO Omni Flash Video Edit · 视频编辑接口</h1>
+    <p>基于 1 个参考视频地址进行编辑，可附加参考图片。</p>
+  </header>
+  <main>
+    <article>
+      <a class="notice-link" href="omni-video-content-review-guide.html">
+        <strong>内容审查避坑提醒：编辑视频前先检查素材和提示词</strong>
+        <p>如果返回 <code>didn't pass content review</code>，重试或换账号通常无效，需要改提示词、参考视频或参考图。</p>
+        <p class="excerpt">真人正脸、未成年人、性/暴力/危险、品牌 IP、医疗病症、政治宗教等内容更容易被拒。</p>
+      </a>
+
+      <h2>提交任务</h2>
+<pre><code>curl -X POST https://xxx.xxx.xxx/v1/videos \
   -H "Authorization: Bearer api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -10,4 +33,93 @@
     "Ingredients_images": [
       "https://your-cdn.com/product.jpg"
     ]
-  }'</code></pre><h2>参数</h2><table><tr><th>字段</th><th>说明</th></tr><tr><td><code>video_url</code></td><td>必填，只支持 1 个参考视频地址</td></tr><tr><td><code>Ingredients_images</code></td><td>可选，参考图片 URL 数组</td></tr><tr><td><code>duration</code></td><td>固定 10</td></tr></table></article></main></body></html>
+  }'</code></pre>
+
+      <h2>参数</h2>
+      <table>
+        <tr><th>字段</th><th>说明</th></tr>
+        <tr><td><code>model</code></td><td>固定 <code>veo-omni-flash-video-edit</code></td></tr>
+        <tr><td><code>video_url</code></td><td>必填，只支持 1 个参考视频地址</td></tr>
+        <tr><td><code>Ingredients_images</code></td><td>可选，参考图片 URL 数组</td></tr>
+        <tr><td><code>duration</code></td><td>固定 10</td></tr>
+        <tr><td><code>aspect_ratio</code></td><td><code>16:9</code> / <code>9:16</code>，默认横屏</td></tr>
+      </table>
+
+      <h2>查询任务</h2>
+<pre><code>curl https://xxx.xxx.xxx/v1/videos/8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234 \
+  -H "Authorization: Bearer api-key"</code></pre>
+
+      <h2>查询返回示例</h2>
+      <p>处理中：</p>
+<pre><code>{
+  "id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "task_id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "object": "video",
+  "created_at": 1714200000000,
+  "status": "in_progress",
+  "state": "in_progress",
+  "task_status": "in_progress",
+  "progress": 45,
+  "model": "veo-omni-flash-video-edit",
+  "video_url": null,
+  "metadata": {
+    "result_urls": []
+  },
+  "seconds": "10",
+  "duration": 10,
+  "aspect_ratio": "16:9",
+  "success": false,
+  "final": false
+}</code></pre>
+      <p>完成：</p>
+<pre><code>{
+  "id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "task_id": "8c7e4b0e6f3b4b0a9e0a0d8f4f0c1234",
+  "object": "video",
+  "created_at": 1714200000000,
+  "status": "completed",
+  "state": "completed",
+  "task_status": "completed",
+  "progress": 100,
+  "model": "veo-omni-flash-video-edit",
+  "video_url": "https://xxx.xxx.xxx/generated/video.mp4",
+  "url": "https://xxx.xxx.xxx/generated/video.mp4",
+  "metadata": {
+    "result_urls": ["https://xxx.xxx.xxx/generated/video.mp4"]
+  },
+  "seconds": "10",
+  "duration": 10,
+  "aspect_ratio": "16:9",
+  "success": true,
+  "final": true,
+  "completed_at": 1714200180000
+}</code></pre>
+
+      <h2>查询返回字段</h2>
+      <table>
+        <tr><th>字段</th><th>说明</th></tr>
+        <tr><td><code>id</code> / <code>task_id</code></td><td>任务 ID，用于继续查询</td></tr>
+        <tr><td><code>status</code> / <code>state</code> / <code>task_status</code></td><td>任务状态，三者值一致，便于兼容不同中转站</td></tr>
+        <tr><td><code>progress</code></td><td>进度，0-100</td></tr>
+        <tr><td><code>video_url</code></td><td>视频任务完成后的主结果地址</td></tr>
+        <tr><td><code>url</code></td><td>完成后的通用结果地址，视频任务等同于 <code>video_url</code></td></tr>
+        <tr><td><code>metadata.result_urls</code></td><td>结果地址数组，通常取第一项即可</td></tr>
+        <tr><td><code>seconds</code> / <code>duration</code></td><td>任务时长，来自提交参数</td></tr>
+        <tr><td><code>aspect_ratio</code></td><td>画面比例，来自提交参数</td></tr>
+        <tr><td><code>success</code></td><td><code>status</code> 为 <code>completed</code> 时为 <code>true</code></td></tr>
+        <tr><td><code>final</code></td><td><code>completed</code> 或 <code>failed</code> 时为 <code>true</code></td></tr>
+        <tr><td><code>error.message</code></td><td>失败原因，仅失败时返回</td></tr>
+      </table>
+
+      <h2>状态说明</h2>
+      <table>
+        <tr><th>status</th><th>含义</th><th>处理方式</th></tr>
+        <tr><td><code>queued</code></td><td>排队中</td><td>继续轮询</td></tr>
+        <tr><td><code>in_progress</code></td><td>生成中</td><td>继续轮询</td></tr>
+        <tr><td><code>completed</code></td><td>已完成</td><td>读取 <code>video_url</code>、<code>url</code> 或 <code>metadata.result_urls</code></td></tr>
+        <tr><td><code>failed</code></td><td>失败</td><td>查看 <code>error.message</code></td></tr>
+      </table>
+    </article>
+  </main>
+</body>
+</html>
