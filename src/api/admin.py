@@ -5591,6 +5591,11 @@ async def open_account_mapping_window(
                 raise RuntimeError("Google Authenticator 已验证，但绑定缺少 space_pk/platform_account_id，无法同步新 EFA")
             efa_update_result = await _update_space_account_efa_impl(account_space_pk, account_id, new_efa)
             efa_change_result["efa_update"] = efa_update_result
+            remark_affected = await db.update_window_remark(space_pk=account_space_pk, window_key=window_key, remark="0")
+            efa_change_result["window_remark_update"] = {
+                "affected": remark_affected,
+                "window_remark": "0",
+            }
             if close_google_2fa_page_after_success and google_2fa_page is not None:
                 try:
                     await google_2fa_page.close()

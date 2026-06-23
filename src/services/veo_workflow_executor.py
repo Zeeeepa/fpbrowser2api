@@ -1478,6 +1478,7 @@ async def _veo_remove_result_video_watermark(
     *,
     payload: Dict[str, Any],
     project_id: str,
+    model_key: str = "",
     progress_cb: ProgressCB,
     log_file: Path,
 ) -> Dict[str, Any]:
@@ -1521,6 +1522,9 @@ async def _veo_remove_result_video_watermark(
         form_data = {
             "video_url": download_url,
         }
+        watermark_type = str(payload.get("watermark_type") or payload.get("video_watermark_type") or "").strip()
+        if watermark_type:
+            form_data["watermark_type"] = watermark_type
         async with httpx.AsyncClient(timeout=httpx.Timeout(process_timeout, connect=20.0, read=process_timeout)) as client:
             response = await client.post(service_url, data=form_data)
             response.raise_for_status()
@@ -1542,7 +1546,8 @@ async def _veo_remove_result_video_watermark(
             log_file,
             "[veo][video-wm] remote processed "
             f"frames={meta.get('frame_count') or meta.get('frames')} "
-            f"position={meta.get('position')} score={meta.get('detection_score')}",
+            f"roi={meta.get('roi')} margin=({meta.get('roi_margin_right')},{meta.get('roi_margin_bottom')}) "
+            f"kind={meta.get('watermark_kind')} score={meta.get('detection_score')}",
         )
         if service_result.get("storage_object_key"):
             meta["storage_object_key"] = service_result.get("storage_object_key")
